@@ -11,11 +11,24 @@ test is not proof of tenant permission, connectivity, licensing, or complete cov
 Import `createMicrosoft365Connectors` from `src/connectors/microsoft365.mjs`.
 The adjacent `microsoft365.d.mts` declares the complete TypeScript interface.
 Use this adapter instead of, not alongside, another Graph adapter for the same
-source and owner. In integrated app commit `ec17439`, the existing local server
-constructs this adapter, maps the selected connectors, gates connection on
-explicit owner consent, and queues bounded source refreshes. This change does
-not modify those host surfaces. The host still needs to supply
+source and owner. In integrated app commit `ec17439`, the local server constructs this adapter,
+maps selected connectors, gates connection on explicit owner consent, and queues
+bounded source refreshes. This branch also wires the exact-parent Teams reply
+read into the local Activity UI and worker. The host still needs to supply
 `microsoft365Options.tokenProvider`; without it, connection remains disconnected.
+
+The local host orders authenticated connect/disconnect requests before reading
+their bodies. A successfully applied newer decision rejects an older deferred
+request with HTTP 409, without acquiring credentials or clearing source health.
+Invalid or failed attempts do not advance that ordering boundary. Disconnect
+aborts pending authentication; shutdown also rejects deferred connects with
+HTTP 503 and prevents a late result from saving connection consent. These are
+host lifecycle guards, not authentication or synchronization guarantees.
+If the verified connection's consent cannot be durably saved, the host
+disconnects it and reports `consent_persistence_failed`; it does not expose a
+connected session after reporting failure. An earlier disconnect that completes
+while a newer connect is still authenticating cancels that connect rather than
+claiming it succeeded.
 
 ```js
 import { createMicrosoft365Connectors } from './connectors/microsoft365.mjs';
@@ -35,6 +48,9 @@ await m365.connect({
     chats: approvedChatIds,
     channels: approvedChannels,       // [{ teamId, channelId }]
     transcripts: approvedTranscripts, // [{ meetingId, transcriptId }]
+    oneNotePages: ownerSelectedOneNotePageIds,
+    meetingInsights: approvedInsights, // [{ meetingId, insightId }]
+    meetingInsightMeetings: approvedMeetingIdsForListing, // exact meeting IDs, separately selected
     files: approvedFiles              // [{ driveId, itemId }]
   },
   allowReplyDrafts: ownerEnabledUnsentReplyDrafts
@@ -61,26 +77,61 @@ The existing core contract is preserved:
   `contentAvailable:true`, `contentType:'text/plain'`, the verified Graph `eTag`,
   explicit provenance and `trust:'untrusted-evidence'`. It accepts only IDs
   already selected at connect.
+- `connectors.teamsChannels.readReplies({teamId,channelId,messageId,signal})`
+  verifies the exact root message in a currently pinned channel and returns it
+  as `parent` plus up to 50 replies in `items`. The replies remain untrusted,
+  read-only historical evidence.
+- The local UI submits only
+  `{sourceReference:{jobId,resultId,itemId}}` to
+  `POST /api/teams/channel-replies`. The server resolves the raw team/channel/
+  message IDs from a private binding saved with the exact source-refresh result;
+  that binding is removed from `/api/state` and `/api/jobs` responses. Queueing
+  and worker execution both require the latest source result, matching owner,
+  unchanged consent revision and the exact still-pinned channel. Replaced or
+  legacy evidence fails visibly and requires a fresh bounded check. Restart or
+  reconnect rotates the consent revision and clears the in-memory latest-result
+  pointer, so old previews cannot authorize reads after a new connection.
+- `connectors.oneNote.read({signal})` reads only page IDs explicitly selected as
+  `sources.oneNotePages` by the current owner. It returns HTML as a string
+  (`contentType:'text/html'`), with no HTML parsing, markdown interpretation,
+  resource/image fetch, continuation, or metadata discovery. The application
+  preview inserts the excerpt as inert text, including literal markup.
+  Responses must have `text/html`, declare no charset or UTF-8, decode as valid UTF-8, and contain a root
+  `<html>` element. A malformed, oversized, or invalidly encoded page is
+  discarded and recorded as a partial coverage gap; it is never replaced with
+  alternate content.
 - `coverage` is **an object**, not a completion percentage:
-  `{status:'bounded'|'partial',limitations:string[],gaps:[{sourceIndex,code}]}`.
+  `{status:'bounded'|'partial',limitations:string[],gaps:[{sourceIndex,code}],successfulRequests:number}`.
   `bounded` means only the stated bounded request was completed, never that a
   mailbox, channel, tenant, or outstanding-task review is complete.
+  Successful empty selected pages count as successful requests; all denied or
+  unavailable selections count as zero. The host reports zero-success reads as
+  unavailable, never a successful partial read, and retains actionable gaps.
+  A current source is access-verified only when at least one request succeeded
+  and no selected permission/availability/format gap exists. Pagination alone
+  is a coverage limitation, not a permission gap; no full sync is implied.
+  Mixed current-authorized success plus selected gaps is `partial-access` with
+  `available:false`, not all-denied `access-unverified`. Connections and Activity
+  both show selected-source gap indexes/codes as inert text, without adding item
+  content to health.
 - `status()` is a local snapshot with `state`, `reason`, `verifiedOwner`,
-  `identity`, `enabled`, and `unavailable`. The standalone selected-content
-  adapter does not mean the host app has a content-read route or display.
+  `identity`, `enabled`, and `unavailable`; it is not host read-health state.
+  The host adds independently guarded selected-content routes and bounded
+  source-health evidence.
   `enabled` uses configuration keys
-  `mail`, `calendar`, `chats`, `channels`, `transcripts`, `files`.
+  `mail`, `calendar`, `chats`, `channels`, `transcripts`, `oneNotePages`,
+  `meetingInsights`, `meetingInsightMeetings`, `files`.
   This is not a last-sync timestamp or a per-source permission check.
 - `disconnect()` invalidates the session and aborts active requests.
 
 The host must map its source names to `mail`, `calendar`, `teamsChats`,
-`teamsChannels`, `transcripts`, and `files`. `loop.read()` and
-`meetingInsights.read()` explicitly reject with `source_unavailable`, without
-accessing the network. The adapter exposes the optional
+`teamsChannels`, `transcripts`, `oneNote`, `meetingInsights`, `meetingInsightList`, and `files`. `loop.read()`
+explicitly rejects with `source_unavailable`, without accessing the network.
+The adapter exposes the optional
 `files.readContent({driveId,itemId,approvedHost,confirmRead:true,signal})` operation
-for one explicitly selected plain-text file. The integrated app does not yet
-expose a user route or local display for this operation; its worker remains
-metadata-only and `status().unavailable` includes `fileContent`. A disconnected
+for one explicitly selected plain-text file. The integrated app exposes
+a per-read approved route, worker and inert local display. Its default Windows
+transport remains unavailable rather than bypassing network policy. A disconnected
 adapter rejects other reads with `disconnected`; a connected but unselected
 source rejects `source_not_authorized`.
 
@@ -145,8 +196,12 @@ continuation URLs and any further redirects are never followed.
 | `mail.read` | `GET /me/mailFolders/inbox/messages` | `Mail.Read` | Newest first, at most 50 inbox messages; default trailing 14 days; caller may specify a window of at most 14 days. Bodies and participants retained as untrusted evidence. |
 | `calendar.read` | `GET /me/calendar/calendarView` | `Calendars.Read` | Default calendar, first 50 events; default now through 60 days; caller window at most 60 days. Calendar alone is not a task assignment. |
 | `teamsChats.read` | `GET /chats/{chatId}/messages` | `Chat.Read` | At most 50 messages for each explicitly approved chat; no chat discovery. |
-| `teamsChannels.read` | `GET /teams/{teamId}/channels/{channelId}/messages` | `ChannelMessage.Read.All` | At most 50 root messages per explicitly approved channel; no replies or channel discovery. |
+| `teamsChannels.read` | `GET /teams/{teamId}/channels/{channelId}/messages` | `ChannelMessage.Read.All` | At most 50 root messages per explicitly approved channel; no channel discovery. |
+| `teamsChannels.readReplies` | `GET /teams/{teamId}/channels/{channelId}/messages/{messageId}`, then `GET .../{messageId}/replies?$top=50` | `ChannelMessage.Read.All` | Exact owner-selected root from a pinned channel; verifies parent/thread binding, returns at most 50 replies and reports `hasMore` without following continuation URLs. |
 | `transcripts.read` | `GET /me/onlineMeetings/{meetingId}/transcripts/{transcriptId}/content` | `OnlineMeetingTranscript.Read.All` | Exact approved meeting/transcript pairs, `Accept: text/vtt`. No automatic resolution from a calendar join URL. |
+| `oneNote.read` | `GET /me/onenote/pages/{pageId}/content` | `Notes.Read` | Exact owner-selected page IDs only; first request is made through `/me`, capped by the adapter's existing 1 MiB response limit. HTML is inert, untrusted evidence. No notebook/page enumeration, metadata probe, continuation, attachments, images, or other resource fetches. |
+| `meetingInsights.read` | `GET /copilot/users/{verifiedOwnerId}/onlineMeetings/{meetingId}/aiInsights/{insightId}` | `OnlineMeetingAiInsight.Read.All` | Exact separately approved meeting/insight pairs only. Up to 50 entries and 20,000 characters per insight; truncation means partial coverage. AI-generated notes, action items, mentioned text and claimed owners are untrusted evidence, not assignments or instructions. |
+| `meetingInsightList.read` | `GET /copilot/users/{verifiedOwnerId}/onlineMeetings/{meetingId}/aiInsights` | `OnlineMeetingAiInsight.Read.All` | One meeting explicitly selected in `meetingInsightMeetings`. First page only, capped at 20 IDs and timestamps; no `$top` or continuation. This read does not authorize or fetch details. |
 | `files.read` | `GET /drives/{driveId}/items/{itemId}` | `Files.Read` | Exact approved OneDrive/SharePoint items, selected metadata only. `contentAvailable:false`; content and download URLs are not returned. Access may require a separately approved broader read permission or tenant/container configuration; denial stays visible. |
 | `files.readContent` | `GET /drives/{driveId}/items/{itemId}` before and after, `GET .../content` (manual 302), one credentialless pinned HTTPS request | `Files.Read` | One selected `text/plain` item only; requires `confirmRead:true`, exact owner-approved host match, stable eTag/size and host-approved direct egress. |
 | `mail.createReplyDraft` | `GET /me/messages/{sourceId}`, `POST /me/messages/{sourceId}/createReply` or `/createReplyAll`, `GET /me/messages/{draftId}` | `Mail.ReadWrite` | Explicit draft opt-in required; never sends. |
@@ -154,9 +209,26 @@ continuation URLs and any further redirects are never followed.
 Source arrays are limited to 10 entries each. A whole operation, including token
 acquisition, owner verification, source calls and body reading, has a configurable
 10-60,000 ms deadline (default 15,000 ms); each response is limited to 1 MiB.
+OneNote previews show at most 600 characters per page and report when that
+excerpt is truncated; the adapter discards a response above 1 MiB rather than
+claiming a truncated page is complete. For selected pages, malformed, oversized
+and invalid-UTF-8 responses are reported by source index as partial gaps; other
+valid selected pages can still be returned. The optional bounded
+`GET /me/onenote/notebooks?$top=1&$select=id,displayName` connection probe is
+not implemented; no notebook coverage or source access is inferred from owner
+verification alone.
 Mail/calendar request windows are bounded in length, not an exhaustive historical
 scan policy. The host should pass its own fixed scan window, quiet-hours and queue
-constraints. Teams reads are recent first-page evidence, not a date-window scan.
+constraints. The local worker rechecks pause, quiet hours and shutdown before
+each new source read and after every awaited source result. An already-started
+connector receives an abort signal; if it nevertheless completes after a
+lifecycle stop, its late result is discarded and that source plus remaining
+unstarted sources are marked `deferred`. Earlier completed source results remain
+partial only while their owner/authorization/connection is still current.
+Neither outcome claims a full synchronization. Teams reads are recent first-page
+evidence, not a date-window scan.
+The reply method fetches only one exact root message and its bounded reply page;
+it never discovers other threads or treats historical text as a command.
 
 `hasMore:true` marks uninspected server pagination and forces partial coverage.
 No continuation is currently exposed or consumed. For pinned sources,
@@ -166,11 +238,28 @@ A partial result can have zero items: it is not proof there is no work.
 
 ### Selected text content adapter and host boundary
 
-The integrated worker currently makes a bounded metadata read for each explicitly
-selected OneDrive/SharePoint item; that is not document content. Reference workflow
-documentation describes notes/documents as reads for a specific request or
-configured source, not a blanket file/notebook sync, and saved Loop pages as
-owner-opted-in reads. This connector does not claim that broader content workflow.
+The local app now exposes a one-file, owner-triggered text read in Activity.
+Metadata source checks still return `contentAvailable:false`; they do not
+silently fetch file content. To enable the optional content action, the owner
+must include an exact canonical lowercase hostname on the selected file entry
+in the Operations source JSON, for example
+`{"driveId":"<selected-drive-id>","itemId":"<selected-item-id>","approvedHost":"example.invalid"}`.
+The host validates and persists that setting with the current source consent.
+It is not inferred from Graph's `webUrl`, source text, or the download URL.
+`GET /api/connections` reports whether a trusted delegated sign-in, current file
+selection and compatible transport are ready for a deliberate read. An
+unavailable state disables the Activity action and names the reason; it never
+falls back to a different downloader.
+
+The browser's `POST /api/files/content-read` request accepts only
+`{sourceReference:{jobId,resultId,itemId},confirmRead:true}`. The user must
+confirm each read in the UI. The server resolves drive/item IDs and the approved
+hostname from private persisted evidence, then checks the exact latest source
+result, result ID, owner, connection and consent at queue time and again when
+the worker begins. Server-only drive/item bindings are removed from every
+returned job. Stale or legacy metadata lacking these bindings is non-actionable
+and requires a fresh bounded source check. Retries also require a new explicit
+approval and the same current source/owner checks.
 
 Microsoft Graph's documented drive-item `/content` API responds with `302 Found`
 to a short-lived preauthenticated download URL; the URL does not require a Graph
@@ -179,15 +268,6 @@ the bearer token is sent only to fixed Graph endpoints. The signed URL is
 transient in memory as the storage request target, never returned or persisted;
 the default downloader does not log it. A trusted custom downloader receives the
 URL and must uphold the same no-log/no-persist rule.
-The source selection currently contains only drive/item IDs; the integrated
-server's strict consent schema accepts no owner-approved content host, and its
-worker only invokes the metadata `read()` operation. Thus there is no separate
-owner-triggered, CSRF-gated content-read action or exact-host approval to honor.
-Do not treat Graph's returned `webUrl` as owner approval. For standalone host
-integration, every read requires the exact selected `driveId`/`itemId`, an
-owner-approved canonical hostname, and `confirmRead:true`. The host must present
-that hostname in the owner-controlled action; source text, metadata and the
-download URL cannot supply approval.
 
 Even with such a host approval, the connector must require the selected item's
 validated HTTPS `webUrl` hostname to match the separately owner-approved exact
@@ -208,7 +288,10 @@ re-reads item metadata afterward; it returns content only if the `eTag` and
 size remain unchanged. Missing revision evidence or a changed item fails
 visibly.
 
-Direct egress is disabled by default. A trusted host must set
+Direct egress is disabled by default. On Windows, the app's built-in selected
+file transport is reported unavailable because it cannot establish that system
+proxy policy is preserved. The app does not attempt another route. A trusted
+host must set
 `allowDirectFileEgress:true` only after verifying that direct HTTPS is permitted
 by the host's network policy; this option applies only to the built-in downloader.
 Standard HTTP(S)/ALL_PROXY variables, npm `*_proxy` variables (upper- and
@@ -222,13 +305,15 @@ Proxy transport is unsupported here because its DNS, destination pinning and TLS
 boundary are not established. A custom downloader is trusted host code and must
 independently prove equivalent destination, TLS, proxy and credential boundaries.
 
-The adapter returns the selected text only in memory as
-`trust:'untrusted-evidence'` with explicit provenance. The host still needs a
-local-origin/CSRF-gated owner action, and a display that renders content as
-inert escaped plain text (for example `textContent` in a `<pre>`), not HTML.
-Do not pass it to the worker, task discovery, an assistant/model, or cloud
-storage. Other file formats, arbitrary hosts, Loop content and converted-format
-reads remain unavailable. No live redirect or user file was accessed.
+The successful per-read result is stored only in the local workspace job record
+and rendered in a bounded-height `<pre>` via `textContent`, with its item title,
+Graph web link, eTag, timestamp, byte count, provenance and explicit partial
+coverage. It remains `trust:'untrusted-evidence'`; it is not interpreted as
+instructions, converted into a task, submitted to a model, uploaded, shared, or
+used to initiate another source action. Only exact selected `text/plain` items
+up to 1 MiB are supported. Other formats, arbitrary hosts, Loop content and
+converted-format reads remain unavailable. No live redirect or user file was
+accessed in tests.
 
 ### Opaque identifier compatibility boundary
 
@@ -312,8 +397,12 @@ key. Each successful worker source result receives a fresh local `resultId`,
 including an explicit retry of the same job. Before reserving any draft operation
 or calling Graph, the host requires an active verified connection, an exact mail
 result/item/message-ID match and equality between the stored result's
-`ownerReference` and the currently verified identity. Missing, replaced or
-other-owner evidence is rejected without network requests or ledger writes.
+`ownerReference` and the currently verified identity. It also requires the
+result's authorization fingerprint to match the current consent generation and
+exact mail selection. Missing, replaced, reselected or other-owner evidence is
+rejected without network requests or ledger writes. A previously completed
+draft request may return its stored receipt idempotently; that does not authorize
+a new Graph request.
 Invalid/incomplete references are never treated as manually entered IDs.
 Existing previews without `resultId` cannot authorize a preview-driven request;
 run a new explicit bounded source check. Requests with no `sourceReference`
@@ -345,6 +434,12 @@ title/link/excerpt snapshot, not credentials or a new source read. Restart and
 later source-job retries do not replace these references or the saved evidence;
 deduplication retains the original task unchanged. Legacy evidence without these
 references is preserved as-is, with no inferred or fabricated provenance.
+
+Source-read coverage is similarly bound to the active consent generation and
+selection, not only the current user identity. The worker rechecks that binding
+at request boundaries and before retaining a result. A reconnect or selection
+change makes prior read coverage non-current; prior bounded results remain
+local historical evidence but cannot authorize a new source action or draft.
 
 The host remains responsible for durable operation deduplication, checking current
 thread context/sent replies and suitable existing drafts, task ownership,
@@ -385,17 +480,67 @@ Always prioritize `outcomeUnknown` when presenting a draft failure.
   autonomous execution, queue or schedule is hidden inside this connector.
 - Safe paginated inbox/thread/draft reads and durable draft reconciliation are
   needed before claiming full email review or automatic draft reuse.
-- Channel replies, attachment reads, transcript discovery and meeting-ID resolution
-  are not implemented. Transcript access also depends on meeting participation,
-  expiry and tenant controls. If speaker-attributed VTT is denied, that denial is
-  retained; there is no silent fallback to a different attribution format.
-- Meeting AI insights are explicitly unavailable pending a separately reviewed
-  documented API, licensing/permission model and owner-approved scope.
-- The selected `text/plain` content adapter is implemented, but no host route,
-  per-read UI approval or local display is wired. The app worker remains
-  metadata-only; do not claim content sync. Other formats, unattended reads and
-  host-UI exposure remain unavailable until local-origin/CSRF gates, explicit
-  owner approval, inert rendering and proxy-policy review are wired.
+- Channel replies are available only for one exact parent in a currently pinned
+  channel, through the local Activity UI and server worker. The worker rechecks
+  the latest result revision, verified owner, consent fingerprint and pinned
+  source immediately before the GET-only connector call, then stores replies as
+  inert local evidence. There is no channel/thread discovery, exhaustive reply
+  pagination or Teams mutation surface. Attachment reads, transcript discovery
+  and meeting-ID resolution are not implemented. Transcript access also depends
+  on meeting participation, expiry and tenant controls. If speaker-attributed
+  VTT is denied, that denial is retained; there is no silent fallback to a
+  different attribution format.
+- Meeting AI insights are disabled by default and require an explicitly selected
+  meeting ID and insight ID, separate consent, the delegated scope above, a work
+  or school account and a Microsoft 365 Copilot license. Supported meetings are
+  private scheduled meetings, town halls, webinars and Meet Now, not channel
+  meetings. The meeting must be recorded/transcribed and processing can take up
+  to four hours; expired or otherwise inaccessible artifacts remain unavailable.
+  The API supports the global cloud only. The owner can separately select a
+  meeting for listing and request one first page with explicit per-request consent;
+  queued requests are bound to the current connection generation and fail after
+  disconnect, reconnect, shutdown or restart. The UI displays only historical
+  metadata; it cannot bind a chosen list result directly to detail consent. That
+  safe interactive selection workflow remains unimplemented. Detail reads still
+  require an independently configured meeting/insight pair and explicit source
+  consent; a list never expands this configuration. No `@odata.nextLink` is followed.
+  A shared list-health record verifies only one meeting. With multiple selected
+  meetings, Connections conservatively remains `partial-access` even after
+  separate successful lists; it does not accumulate proof across selections or
+  automatically read the other meetings. The bounded limitation is visible.
+  Generic job retry is prohibited for lists. Every additional attempt requires a
+  new explicit list consent. The form blocks overlapping requests, identifies
+  uncertain receipts, and asks the owner to check Activity before starting again.
+  This temporary form guard is not retained across page reloads; after a reload,
+  inspect Activity before giving new consent.
+  Without an approved delegated provider, this capability remains disconnected.
+  The worker stores at most a 600-character preview per returned insight in the
+  local workspace; it does not create tasks or execute source content. A full
+  20,000-character detail viewer is not implemented; only that excerpt is shown.
+
+Active refresh results are revalidated against current owner, nonempty consent
+authorization and connection generation immediately before persistence, including
+results collected before a later source awaited. Stale results are discarded,
+not retained as a newly successful read. Meeting-list consent is checked before
+dispatch, after the awaited read and before retention. Already-completed jobs
+remain historical local evidence and cannot authorize new actions without the
+separate current-source checks.
+
+Pause, quiet hours and worker shutdown prevent later request dispatch and
+retention of a late active read. The worker checks after awaiting a read and
+before accepting its evidence; list/reply/file jobs also check immediately
+before their final job transition. Already-completed earlier sources can remain
+partial if authorization is current. Owner/consent/connection changes discard
+stale active results regardless of lifecycle controls. Trusted injected
+connectors must honor the supplied signal/checkpoint at their own request
+boundaries; ignoring abort cannot bypass retention checks. A network request
+already started may physically finish, but its late content is not retained.
+These source-only guards do not invalidate already-started local file/SQLite
+writes or turn a completed local-output operation into a failure.
+- The selected `text/plain` content adapter has an explicit per-read approval
+  route and inert local display. The default Windows transport remains disabled
+  because preservation of configured network/proxy policy cannot be established.
+  Other formats, unattended reads and content sync remain unavailable.
 - Loop page content is explicitly unavailable. It is not inferred from a drive
   item's filename or metadata, and no desktop/browser reader is launched.
 - No business-reporting integration or writes, Teams writes, Planner/To Do,
@@ -528,7 +673,12 @@ Public Microsoft documentation consulted 2026-11-11:
 - [Calendar view](https://learn.microsoft.com/en-us/graph/api/calendar-list-calendarview?view=graph-rest-1.0)
 - [Chat messages](https://learn.microsoft.com/en-us/graph/api/chat-list-messages?view=graph-rest-1.0)
 - [Channel root messages](https://learn.microsoft.com/en-us/graph/api/channel-list-messages?view=graph-rest-1.0)
+- [Channel message replies](https://learn.microsoft.com/en-us/graph/api/chatmessage-list-replies?view=graph-rest-1.0)
+- [Get a channel message](https://learn.microsoft.com/en-us/graph/api/chatmessage-get?view=graph-rest-1.0)
 - [Transcript content and tenant controls](https://learn.microsoft.com/en-us/graph/api/calltranscript-get?view=graph-rest-1.0)
+- [Get meeting AI insight](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/ai-services/meeting-insights/callaiinsight-get)
+- [List meeting AI insights](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/ai-services/meeting-insights/onlinemeeting-list-aiinsights)
+- [Teams meeting AI insights prerequisites](https://learn.microsoft.com/en-us/microsoftteams/platform/graph-api/meeting-transcripts/meeting-insights)
 - [Drive item metadata](https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0)
 - [IANA IPv4 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml)
 - [Download drive item content and preauthenticated redirect behavior](https://learn.microsoft.com/en-us/graph/api/driveitem-get-content?view=graph-rest-1.0)

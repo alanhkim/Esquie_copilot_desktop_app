@@ -2,6 +2,11 @@ import { createHash, randomUUID } from 'node:crypto';
 
 const MAX_TEXT_LENGTH = 16_000;
 const MAX_ROWS = 100;
+const SOURCE_PROVENANCE = {
+  pasted: 'owner-pasted-unverified',
+  'screenshot-ocr': 'owner-stated-screenshot-ocr-unverified',
+  'screenshot-ocr-edited': 'owner-stated-screenshot-ocr-edited-unverified'
+};
 
 function invalid(message) {
   const error = new Error(message);
@@ -66,6 +71,17 @@ function importKey(row) {
   return JSON.stringify([row.date, normalize(row.account), normalize(row.workshop)]);
 }
 
+function provenanceFor(sourceMethod = 'pasted') {
+  if (typeof sourceMethod !== 'string' || !Object.hasOwn(SOURCE_PROVENANCE, sourceMethod)) {
+    throw invalid('Source method must be pasted, screenshot OCR, or edited screenshot OCR.');
+  }
+  return SOURCE_PROVENANCE[sourceMethod];
+}
+
+function sourceMethodHash(revision, textHash, sourceMethod) {
+  return createHash('sha256').update(JSON.stringify([revision, textHash, sourceMethod])).digest('hex');
+}
+
 function storedImportKeys(record) {
   const source = record.workshopImport;
   const keys = new Set();
@@ -84,8 +100,8 @@ function storedImportKeys(record) {
 
 function digest(records) {
   const relevant = records.filter(record => ['outcome', 'engagement'].includes(record.category))
-    .map(({ id, revision, category, title, note, date, importKey: key, sourceUrl, workshopImport }) =>
-      ({ id, revision, category, title, note, date, importKey: key || '', sourceUrl: sourceUrl || '', workshopImport: workshopImport || null }))
+    .map(({ id, revision, category, title, note, date, importKey: key, sourceUrl, workshopImport, provenance }) =>
+      ({ id, revision, category, title, note, date, importKey: key || '', sourceUrl: sourceUrl || '', workshopImport: workshopImport || null, provenance: provenance || '' }))
     .sort((left, right) => String(left.id).localeCompare(String(right.id)));
   return createHash('sha256').update(JSON.stringify(relevant)).digest('hex');
 }
@@ -146,7 +162,8 @@ export function parseMonthlyOutcomeTable(text, { today = null } = {}) {
   return rows;
 }
 
-export function previewMonthlyOutcomeImport(records, text, { today = null } = {}) {
+export function previewMonthlyOutcomeImport(records, text, { today = null, sourceMethod = 'pasted' } = {}) {
+  provenanceFor(sourceMethod);
   const rows = parseMonthlyOutcomeTable(text, { today });
   const current = (records || []).filter(record => ['outcome', 'engagement'].includes(record.category));
   const byKey = new Map();
@@ -182,9 +199,13 @@ export function previewMonthlyOutcomeImport(records, text, { today = null } = {}
   for (const items of pasteByKey.values()) {
     if (items.some(item => item.state === 'conflict')) for (const item of items) item.state = 'conflict';
   }
+  const textHash = createHash('sha256').update(text).digest('hex');
+  const revision = digest(records || []);
   return {
-    revision: digest(records || []),
-    textHash: createHash('sha256').update(text).digest('hex'),
+    revision,
+    textHash,
+    sourceMethod,
+    sourceMethodHash: sourceMethodHash(revision, textHash, sourceMethod),
     rows
   };
 }
@@ -195,7 +216,9 @@ export function confirmMonthlyOutcomeImport(state, text, revision, textHash, rev
     error.status = 409;
     throw error;
   }
-  const preview = previewMonthlyOutcomeImport(state.records, text, options);
+  const sourceMethod = options.sourceMethod === undefined ? 'pasted' : options.sourceMethod;
+  const provenance = provenanceFor(sourceMethod);
+  const preview = previewMonthlyOutcomeImport(state.records, text, { ...options, sourceMethod });
   if (typeof textHash !== 'string' || preview.textHash !== textHash) {
     const error = new Error('Pasted text changed after preview. Preview the current text before confirming.');
     error.status = 409;
@@ -206,12 +229,18 @@ export function confirmMonthlyOutcomeImport(state, text, revision, textHash, rev
     error.status = 409;
     throw error;
   }
+  if ((sourceMethod !== 'pasted' || options.sourceMethodHash !== undefined) &&
+      (typeof options.sourceMethodHash !== 'string' || preview.sourceMethodHash !== options.sourceMethodHash)) {
+    const error = new Error('Workshop source method changed after preview. Preview the current import again.');
+    error.status = 409;
+    throw error;
+  }
   const imported = [];
   for (const item of preview.rows) {
     if (item.state !== 'new') continue;
     const record = {
       id: randomUUID(), ...item.record, revision: 1,
-      provenance: 'owner-pasted-unverified', createdAt: now
+      provenance, createdAt: now
     };
     state.records.unshift(record);
     imported.push(record);

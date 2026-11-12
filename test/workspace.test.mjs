@@ -39,18 +39,27 @@ async function workspace(t, options = {}) {
 test('binds only to loopback and serves a hardened fresh-install shell', async t => {
   const { app, baseUrl } = await workspace(t);
   assert.equal(app.server.address().address, '127.0.0.1');
-  const [health, page] = await Promise.all([fetch(`${baseUrl}/api/health`), fetch(baseUrl)]);
+  const [health, page, appModule, importWorkflowModule] = await Promise.all([
+    fetch(`${baseUrl}/api/health`),
+    fetch(baseUrl),
+    fetch(`${baseUrl}/app.js`),
+    fetch(`${baseUrl}/outcome-import-workflow.mjs`)
+  ]);
   const healthBody = await health.json();
   assert.equal(healthBody.status, 'ok');
   assert.equal(healthBody.authenticatedApi, true);
   assert.equal(Object.hasOwn(healthBody, 'automation'), false);
   assert.equal(page.status, 200);
   assert.match(page.headers.get('content-security-policy'), /frame-ancestors 'none'/);
-  assert.match(await page.text(), /Your local workspace/);
   const module = await fetch(`${baseUrl}/task-board.mjs`);
   assert.equal(module.status, 200);
   assert.match(module.headers.get('content-type'), /text\/javascript/);
   assert.match(await module.text(), /export function matchingTasks/);
+  const [pageText, appScript, workflowScript] = await Promise.all([page.text(), appModule.text(), importWorkflowModule.text()]);
+  assert.match(pageText, /Your local workspace/);
+  assert.match(pageText, /<script type="module" src="\/app\.js">/);
+  assert.match(appScript, /from '\.\/outcome-import-workflow\.mjs'/);
+  assert.match(workflowScript, /export function createOutcomeImportWorkflow/);
 });
 
 test('persists task and draft state across a server restart', async t => {
@@ -100,6 +109,48 @@ test('persists task and draft state across a server restart', async t => {
   assert.deepEqual(persisted.profile, { displayName: 'Fake Owner', timezone: 'America/Los_Angeles' });
   assert.equal(persisted.links.length, 1);
   assert.equal(persisted.links[0].url, 'https://example.invalid/reference');
+});
+
+test('identical labeled-link retries deduplicate across restart while distinct labels and destinations remain saveable', async t => {
+  const context = await workspace(t);
+  const body = { title: 'Original synthetic label', url: 'https://EXAMPLE.invalid:443/reference' };
+  const responses = await Promise.all([0, 1].map(() => context.request('/api/links', { method: 'POST', body })));
+  assert.deepEqual(responses.map(response => response.status).sort(), [200, 201]);
+  const results = await Promise.all(responses.map(response => response.json()));
+  assert.equal(results[0].link.id, results[1].link.id);
+  const original = results[0].link;
+  assert.equal(original.url, 'https://example.invalid/reference');
+  const unauthorized = await context.request('/api/links', { method: 'POST', token: '', body: { ...body, title: 'Blocked label' } });
+  assert.equal(unauthorized.status, 403);
+  await context.restart();
+  const retry = await context.request('/api/links', {
+    method: 'POST', body: { title: body.title, url: original.url }
+  });
+  assert.equal(retry.status, 200);
+  const receipt = await retry.json();
+  assert.equal(receipt.deduplicated, true);
+  assert.deepEqual(receipt.link, original);
+  const state = await (await context.request('/api/state')).json();
+  assert.deepEqual(state.links, [original]);
+  assert.equal(state.activity.filter(item => item.kind === 'link-saved').length, 1);
+  const differentlyLabeled = await context.request('/api/links', {
+    method: 'POST', body: { title: 'Different synthetic label', url: original.url }
+  });
+  assert.equal(differentlyLabeled.status, 201, 'the owner may intentionally save the same URL with another label');
+  const second = (await differentlyLabeled.json()).link;
+  assert.notEqual(second.id, original.id);
+  await context.restart();
+  const repeatedLabel = await context.request('/api/links', {
+    method: 'POST', body: { title: second.title, url: second.url }
+  });
+  assert.deepEqual(await repeatedLabel.json(), { link: second, deduplicated: true });
+  const retained = await (await context.request('/api/state')).json();
+  assert.deepEqual(retained.links, [second, original]);
+  assert.equal(retained.activity.filter(item => item.kind === 'link-saved').length, 2);
+  const distinct = await context.request('/api/links', {
+    method: 'POST', body: { title: body.title, url: 'https://example.invalid/different' }
+  });
+  assert.equal(distinct.status, 201, 'equal labels must not imply equal destinations');
 });
 
 test('rejects task mutations without a valid local origin and CSRF token', async t => {

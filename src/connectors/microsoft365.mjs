@@ -18,7 +18,10 @@ const READ_PATHS = [
   /^\/me\/messages\/[^/]+$/,
   /^\/chats\/[^/]+\/messages$/,
   /^\/teams\/[^/]+\/channels\/[^/]+\/messages$/,
+  /^\/teams\/[^/]+\/channels\/[^/]+\/messages\/[^/]+$/,
+  /^\/teams\/[^/]+\/channels\/[^/]+\/messages\/[^/]+\/replies$/,
   /^\/me\/onlineMeetings\/[^/]+\/transcripts\/[^/]+\/content$/,
+  /^\/me\/onenote\/pages\/[^/]+\/content$/,
   /^\/drives\/[^/]+\/items\/[^/]+$/,
   /^\/drives\/[^/]+\/items\/[^/]+\/content$/
 ];
@@ -48,6 +51,38 @@ function list(value, map) {
   return value.map(map);
 }
 
+function insightContent(value, pinned) {
+  if (!value || value.id !== pinned.insightId || typeof value !== 'object' ||
+      Array.isArray(value)) fail('invalid_response');
+  const sections = [];
+  let truncated = false;
+  let count = 0;
+  const append = (label, entry, fields) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+        fields.some(field => entry[field] != null && typeof entry[field] !== 'string')) fail('invalid_response');
+    if (++count > 50) { truncated = true; return; }
+    sections.push(`${label}: ${fields.map(field => entry[field] || '').filter(Boolean).join(' - ')}`);
+  };
+  const entries = (items, handler) => {
+    if (items == null) return;
+    if (!Array.isArray(items)) fail('invalid_response');
+    for (const item of items) handler(item);
+  };
+  if (value.meetingNotes == null && value.actionItems == null && value.viewpoint == null) fail('invalid_response');
+  entries(value.meetingNotes, note => {
+    append('Meeting note', note, ['title', 'text']);
+    entries(note.subpoints, subpoint => append('Subpoint', subpoint, ['title', 'text']));
+  });
+  entries(value.actionItems, item => append('AI-generated action item (owner unverified)', item, ['title', 'text', 'ownerDisplayName']));
+  if (value.viewpoint != null) {
+    if (typeof value.viewpoint !== 'object' || Array.isArray(value.viewpoint)) fail('invalid_response');
+    entries(value.viewpoint.mentionEvents, item => append('Mention', item, ['eventDateTime', 'transcriptUtterance']));
+  }
+  const content = sections.join('\n');
+  if (content.length > 20_000) truncated = true;
+  return { content: content.slice(0, 20_000), truncated };
+}
+
 function text(value) {
   return typeof value === 'string' ? value : '';
 }
@@ -73,6 +108,27 @@ function people(values) {
     name: text(value?.emailAddress?.name),
     address: text(value?.emailAddress?.address)
   }));
+}
+
+function channelMessageEvidence(value, teamId, channelId, errorCode = 'invalid_response') {
+  if (!value || typeof value.id !== 'string' || !value.id ||
+      (value.replyToId !== undefined && value.replyToId !== null &&
+        typeof value.replyToId !== 'string')) fail(errorCode);
+  if (value.channelIdentity !== undefined && value.channelIdentity !== null &&
+      (value.channelIdentity.teamId !== teamId || value.channelIdentity.channelId !== channelId)) {
+    fail(errorCode);
+  }
+  return {
+    id: value.id,
+    ...(typeof value.replyToId === 'string' ? { replyToId: value.replyToId } : {}),
+    teamId, channelId,
+    createdDateTime: text(value.createdDateTime),
+    lastModifiedDateTime: text(value.lastModifiedDateTime),
+    webLink: link(value.webUrl),
+    body: { contentType: text(value.body?.contentType), content: text(value.body?.content) },
+    senderId: text(value.from?.user?.id),
+    trust: 'untrusted-evidence'
+  };
 }
 
 function message(value) {
@@ -161,11 +217,11 @@ export function createMicrosoft365Connectors({
       state, reason, verifiedOwner: state === 'connected',
       identity: connection ? { ...connection.identity } : null,
       enabled: connection ? [...connection.enabled] : [],
-      unavailable: ['loop', 'meetingInsights', 'fileContent']
+      unavailable: ['loop', 'fileContent']
     };
   }
 
-  async function session(config, scopes, signal, action) {
+  async function session(config, scopes, signal, action, checkpoint) {
     const revision = generation;
     const controller = new AbortController();
     controllers.add(controller);
@@ -183,6 +239,7 @@ export function createMicrosoft365Connectors({
     });
     let writeAttempted = false;
     const check = () => {
+      if (typeof checkpoint === 'function' && checkpoint() !== true) fail('operation_paused');
       if (revision !== generation) fail('disconnected');
       if (controller.signal.aborted) fail(timedOut ? 'timeout' : 'cancelled');
     };
@@ -210,13 +267,18 @@ export function createMicrosoft365Connectors({
         }
 
         // Routes are generated only by the closed operations below, never by a caller URL.
-        async function request(path, { method = 'GET', body, accept = 'application/json', manualRedirect = false } = {}) {
+        async function request(path, {
+          method = 'GET', body, accept = 'application/json', manualRedirect = false,
+          expectedContentType
+        } = {}) {
           check();
           const url = new URL(`${GRAPH}${path}`);
           if (url.origin !== 'https://graph.microsoft.com' || !url.pathname.startsWith('/v1.0/')) {
             fail('blocked_request');
           }
-          if (method === 'GET' && !READ_PATHS.some(pattern => pattern.test(url.pathname.slice(5)))) {
+          if (method === 'GET' && !READ_PATHS.some(pattern => pattern.test(url.pathname.slice(5))) &&
+              !config.meetingInsights.some(item => item.path === url.pathname.slice(5)) &&
+              !config.meetingInsightMeetings.some(item => item.path === url.pathname.slice(5))) {
             fail('blocked_request');
           }
           if (manualRedirect && (method !== 'GET' ||
@@ -254,6 +316,19 @@ export function createMicrosoft365Connectors({
             return location;
           }
           if (!response.ok || response.status < 200 || response.status >= 300) fail('service_error');
+          if (expectedContentType) {
+            const declaration = response.headers?.get?.('content-type') || '';
+            const contentType = declaration.split(';', 1)[0].trim().toLowerCase();
+            if (contentType !== expectedContentType) {
+              await response.body?.cancel().catch(() => {});
+              fail('invalid_response');
+            }
+            const charsets = [...declaration.matchAll(/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/gi)];
+            if (charsets.some(match => (match[1] ?? match[2]).trim().toLowerCase() !== 'utf-8')) {
+              await response.body?.cancel().catch(() => {});
+              fail('invalid_content_encoding');
+            }
+          }
           if (!response.body?.getReader) fail('invalid_response');
           const reader = response.body.getReader();
           const cancelRead = () => { reader.cancel().catch(() => {}); };
@@ -273,8 +348,18 @@ export function createMicrosoft365Connectors({
             controller.signal.removeEventListener('abort', cancelRead);
             await reader.cancel().catch(() => {});
           }
-          const content = Buffer.concat(chunks).toString('utf8');
-          if (accept !== 'application/json') return content;
+          const bytes = Buffer.concat(chunks);
+          if (accept !== 'application/json') {
+            if (expectedContentType) {
+              try {
+                return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+              } catch {
+                fail('invalid_content_encoding');
+              }
+            }
+            return bytes.toString('utf8');
+          }
+          const content = bytes.toString('utf8');
           try {
             return JSON.parse(content);
           } catch {
@@ -323,6 +408,24 @@ export function createMicrosoft365Connectors({
         meetingId, transcriptId,
         path: `/me/onlineMeetings/${segment(meetingId)}/transcripts/${segment(transcriptId)}/content`
       })),
+      oneNotePages: list(sources.oneNotePages, id => ({
+        id, path: `/me/onenote/pages/${segment(id)}/content`
+      })),
+      meetingInsights: list(sources.meetingInsights, item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item) ||
+            Object.keys(item).some(key => key !== 'meetingId' && key !== 'insightId')) {
+          fail('invalid_source_configuration');
+        }
+        const { meetingId, insightId } = item;
+        return {
+          meetingId, insightId,
+          path: `/copilot/users/${segment(expectedIdentity.userId)}/onlineMeetings/${segment(meetingId)}/aiInsights/${segment(insightId)}`
+        };
+      }),
+      meetingInsightMeetings: list(sources.meetingInsightMeetings, meetingId => ({
+        meetingId,
+        path: `/copilot/users/${segment(expectedIdentity.userId)}/onlineMeetings/${segment(meetingId)}/aiInsights`
+      })),
       files: list(sources.files, ({ driveId, itemId }) => ({
         driveId, itemId, path: `/drives/${segment(driveId)}/items/${segment(itemId)}`
       })),
@@ -330,7 +433,7 @@ export function createMicrosoft365Connectors({
     };
     config.enabled = [
       ...(config.mail ? ['mail'] : []), ...(config.calendar ? ['calendar'] : []),
-      ...['chats', 'channels', 'transcripts', 'files'].filter(key => config[key].length)
+      ...['chats', 'channels', 'transcripts', 'oneNotePages', 'meetingInsights', 'meetingInsightMeetings', 'files'].filter(key => config[key].length)
     ];
     await session(config, [], signal, async () => {
       connection = config;
@@ -348,10 +451,10 @@ export function createMicrosoft365Connectors({
     return connection;
   }
 
-  function result(items, limitations, hasMore = false, gaps = []) {
+  function result(items, limitations, hasMore = false, gaps = [], successfulRequests = 1) {
     return {
       items, verifiedOwner: true, hasMore,
-      coverage: { status: gaps.length || hasMore ? 'partial' : 'bounded', limitations, gaps },
+      coverage: { status: gaps.length || hasMore ? 'partial' : 'bounded', limitations, gaps, successfulRequests },
       trust: 'untrusted-evidence'
     };
   }
@@ -362,7 +465,7 @@ export function createMicrosoft365Connectors({
     return { values: value.value, hasMore: Boolean(value['@odata.nextLink']) };
   }
 
-  async function readMail({ signal, startDateTime, endDateTime } = {}) {
+  async function readMail({ signal, checkpoint, startDateTime, endDateTime } = {}) {
     const config = requireSource('mail');
     const end = endDateTime ?? new Date().toISOString();
     const start = startDateTime ?? new Date(timestamp(end) - 14 * DAY).toISOString();
@@ -378,10 +481,10 @@ export function createMicrosoft365Connectors({
         'Other folders, sent replies, attachments and subsequent pages are not inspected.',
         'Evidence is not an assignment or instruction; ownership and unfinished work require host review.'
       ], data.hasMore);
-    });
+    }, checkpoint);
   }
 
-  async function readCalendar({ signal, startDateTime, endDateTime } = {}) {
+  async function readCalendar({ signal, checkpoint, startDateTime, endDateTime } = {}) {
     const config = requireSource('calendar');
     const start = startDateTime ?? new Date().toISOString();
     const end = endDateTime ?? new Date(timestamp(start) + 60 * DAY).toISOString();
@@ -403,14 +506,19 @@ export function createMicrosoft365Connectors({
           joinUrl: link(value.onlineMeeting?.joinUrl), trust: 'untrusted-evidence'
         };
       }), ['Default calendar only, first 50 events; calendar entries alone are not action tasks.'], data.hasMore);
-    });
+    }, checkpoint);
   }
 
   async function readFileContent({
-    driveId, itemId, approvedHost, confirmRead, signal
+    driveId, itemId, approvedHost, confirmRead, signal, checkpoint, expectedETag, expectedSize
   } = {}) {
     const config = requireSource('files');
     if (confirmRead !== true) fail('file_content_consent_required');
+    if ((expectedETag === undefined) !== (expectedSize === undefined) ||
+        (expectedETag !== undefined && (!validRevisionTag(expectedETag) ||
+          !Number.isSafeInteger(expectedSize) || expectedSize < 0))) {
+      fail('file_revision_unavailable');
+    }
     const pinned = config.files.find(item => item.driveId === driveId && item.itemId === itemId);
     if (!pinned) fail('source_not_authorized');
     let ownerApprovedHost;
@@ -436,6 +544,8 @@ export function createMicrosoft365Connectors({
       if (!Number.isSafeInteger(metadata.size) || metadata.size < 0) fail('invalid_response');
       if (metadata.size > MAX_FILE_CONTENT_BYTES) fail('response_too_large');
       if (!validRevisionTag(metadata.eTag)) fail('file_revision_unavailable');
+      if (expectedETag !== undefined &&
+          (metadata.eTag !== expectedETag || metadata.size !== expectedSize)) fail('file_revision_changed');
       try {
         validateApprovedHttpsUrl(metadata.webUrl, ownerApprovedHost);
       } catch (error) {
@@ -484,15 +594,16 @@ export function createMicrosoft365Connectors({
         webLink: link(metadata.webUrl), lastModifiedDateTime: text(metadata.lastModifiedDateTime),
         mimeType: 'text/plain', contentAvailable: true, content, contentType: 'text/plain',
         eTag: metadata.eTag,
+        size: metadata.size,
         trust: 'untrusted-evidence', provenance: 'explicit-owner-approved-sharepoint-read'
       }], [
         'One explicitly selected text/plain item, read only after per-read owner approval.',
         'Content is inert untrusted evidence; it is not automatically stored, uploaded, or submitted for inference.'
       ]);
-    });
+    }, checkpoint);
   }
 
-  async function readPinned(source, scope, { signal } = {}) {
+  async function readPinned(source, scope, { signal, checkpoint } = {}) {
     const config = requireSource(source);
     return session(config, [scope], signal, async request => {
       const items = [];
@@ -507,15 +618,36 @@ export function createMicrosoft365Connectors({
               meetingId: pinned.meetingId, transcriptId: pinned.transcriptId,
               content, contentType: 'text/vtt', trust: 'untrusted-evidence'
             });
+          } else if (source === 'oneNotePages') {
+            const content = await request(pinned.path, {
+              accept: 'text/html', expectedContentType: 'text/html'
+            });
+            if (!/^\uFEFF?\s*(?:<!doctype\s+html\b[^>]*>\s*)?<html(?:\s|>)/i.test(content)) {
+              fail('invalid_response');
+            }
+            items.push({
+              id: pinned.id, content, contentType: 'text/html',
+              trust: 'untrusted-evidence'
+            });
+          } else if (source === 'meetingInsights') {
+            const value = await request(pinned.path);
+            const parsed = insightContent(value, pinned);
+            hasMore ||= parsed.truncated;
+            items.push({
+              meetingId: pinned.meetingId, id: pinned.insightId,
+              content: parsed.content, trust: 'untrusted-evidence'
+            });
           } else if (source === 'files') {
             const value = await request(query(pinned.path, {
-              '$select': 'id,name,webUrl,lastModifiedDateTime,size,file,folder'
+              '$select': 'id,name,webUrl,lastModifiedDateTime,size,eTag,file,folder'
             }));
             if (value?.id !== pinned.itemId) fail('invalid_response');
             items.push({
               driveId: pinned.driveId, id: value.id, name: text(value.name),
               webLink: link(value.webUrl), lastModifiedDateTime: text(value.lastModifiedDateTime),
               mimeType: text(value.file?.mimeType), contentAvailable: false,
+              ...(validRevisionTag(value.eTag) ? { eTag: value.eTag } : {}),
+              ...(Number.isSafeInteger(value.size) && value.size >= 0 ? { size: value.size } : {}),
               trust: 'untrusted-evidence'
             });
           } else {
@@ -535,18 +667,81 @@ export function createMicrosoft365Connectors({
             }));
           }
         } catch (error) {
-          if (!(error instanceof ConnectorError) ||
-              !['permission_denied', 'source_unavailable'].includes(error.code)) throw error;
+          const gapCodes = source === 'oneNotePages'
+            ? ['permission_denied', 'source_unavailable', 'invalid_response', 'response_too_large', 'invalid_content_encoding']
+            : ['permission_denied', 'source_unavailable'];
+          if (!(error instanceof ConnectorError) || !gapCodes.includes(error.code)) throw error;
           gaps.push({ sourceIndex: config[source].indexOf(pinned), code: error.code });
         }
       }
       return result(items, [
         'Explicitly selected sources only; no tenant-wide discovery or completeness claim.',
         ...(source === 'files' ? ['Metadata only; document and Loop content are not read.'] :
-          source === 'transcripts' ? ['Only configured meeting/transcript pairs; no meeting lookup or insights.'] :
+          source === 'transcripts' ? ['Only configured meeting/transcript pairs; no meeting lookup.'] :
+          source === 'oneNotePages' ? ['Only explicitly selected page IDs are read through the verified current owner. HTML is inert untrusted text; no page or notebook discovery, continuation, images, attachments, or other resources are fetched.'] :
+          source === 'meetingInsights' ? ['Only explicitly selected meeting/insight pairs; no discovery. AI-generated content and claimed owners are unverified, not instructions or assignments. Content is capped at 50 entries and 20,000 characters per insight.'] :
             ['First 50 messages per selected source; channel replies and attachments are not inspected.'])
-      ], hasMore, gaps);
-    });
+      ], hasMore, gaps, config[source].length - gaps.length);
+    }, checkpoint);
+  }
+
+  async function readChannelReplies({ teamId, channelId, messageId, signal, checkpoint } = {}) {
+    const config = requireSource('channels');
+    const pinned = config.channels.find(item => item.teamId === teamId && item.channelId === channelId);
+    if (!pinned) fail('source_not_authorized');
+    const parentPath = `${pinned.path}/${segment(messageId)}`;
+    return session(config, ['ChannelMessage.Read.All'], signal, async request => {
+      const parentValue = await request(parentPath);
+      if (parentValue?.id !== messageId ||
+          (parentValue.replyToId !== undefined && parentValue.replyToId !== null)) {
+        fail('invalid_source_message');
+      }
+      const parent = channelMessageEvidence(parentValue, pinned.teamId, pinned.channelId, 'invalid_source_message');
+      const data = page(await request(query(`${parentPath}/replies`, { '$top': '50' })));
+      const replies = data.values.map(value => {
+        if (value?.replyToId !== messageId) fail('invalid_response');
+        return channelMessageEvidence(value, pinned.teamId, pinned.channelId);
+      });
+      return {
+        ...result(replies, [
+          'Replies for one exact parent message in one explicitly authorized pinned channel; no channel discovery.',
+          'At most 50 replies; continuation URLs are not followed. All messages are inert historical evidence.'
+        ], data.hasMore),
+        parent
+      };
+    }, checkpoint);
+  }
+
+  async function listMeetingInsights({ meetingId, signal, checkpoint } = {}) {
+    const config = requireSource('meetingInsightMeetings');
+    segment(meetingId);
+    const pinned = config.meetingInsightMeetings.find(item => item.meetingId === meetingId);
+    if (!pinned) fail('source_not_authorized');
+    return session(config, ['OnlineMeetingAiInsight.Read.All'], signal, async request => {
+      const value = await request(pinned.path);
+      if (!value || !Array.isArray(value.value) ||
+          (value['@odata.nextLink'] != null &&
+            (typeof value['@odata.nextLink'] !== 'string' || !value['@odata.nextLink']))) fail('invalid_response');
+      const items = value.value.slice(0, 20).map(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item) ||
+            typeof item.id !== 'string' || !item.id || item.id.length > 2000 ||
+            /[\u0000-\u001f\u007f]/.test(item.id) ||
+            ['createdDateTime', 'endDateTime'].some(key =>
+              item[key] != null && (typeof item[key] !== 'string' || item[key].length > 128))) {
+          fail('invalid_response');
+        }
+        return {
+          meetingId, id: item.id, createdDateTime: item.createdDateTime ?? '',
+          endDateTime: item.endDateTime ?? '', trust: 'untrusted-evidence'
+        };
+      });
+      const truncated = value.value.length > 20 || Boolean(value['@odata.nextLink']);
+      return result(items, [
+        'One explicitly selected meeting; first page only, at most 20 metadata items. No continuation is followed.',
+        ...(truncated ? ['Additional list items were omitted; coverage is partial.'] : []),
+        'List metadata is untrusted and does not authorize or initiate an insight detail read.'
+      ], truncated);
+    }, checkpoint);
   }
 
   async function createReplyDraft({ messageId, text: replyText, replyAll = false, signal } = {}) {
@@ -590,13 +785,19 @@ export function createMicrosoft365Connectors({
       mail: Object.freeze({ read: readMail, createReplyDraft }),
       calendar: Object.freeze({ read: readCalendar }),
       teamsChats: Object.freeze({ read: options => readPinned('chats', 'Chat.Read', options) }),
-      teamsChannels: Object.freeze({ read: options => readPinned('channels', 'ChannelMessage.Read.All', options) }),
+      teamsChannels: Object.freeze({
+        read: options => readPinned('channels', 'ChannelMessage.Read.All', options),
+        readReplies: readChannelReplies
+      }),
       transcripts: Object.freeze({ read: options => readPinned('transcripts', 'OnlineMeetingTranscript.Read.All', options) }),
+      oneNote: Object.freeze({ read: options => readPinned('oneNotePages', 'Notes.Read', options) }),
+      meetingInsights: Object.freeze({ read: options => readPinned('meetingInsights', 'OnlineMeetingAiInsight.Read.All', options) }),
+      meetingInsightList: Object.freeze({ read: listMeetingInsights }),
       files: Object.freeze({
         read: options => readPinned('files', 'Files.Read', options),
         readContent: readFileContent
       }),
-      loop: unavailable, meetingInsights: unavailable
+      loop: unavailable
     })
   });
 }

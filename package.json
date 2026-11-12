@@ -9,6 +9,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "test": "node --experimental-vm-modules --test test/*.test.mjs",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:upgrade": "node scripts/upgrade-smoke.mjs"
   }
 }

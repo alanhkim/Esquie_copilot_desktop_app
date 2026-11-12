@@ -34,11 +34,11 @@
     "extraResources": [
       { "from": "../src", "to": "workspace/src", "filter": [
         "server.mjs", "store.mjs", "worker.mjs", "backups.mjs", "monthly-outcomes-import.mjs",
-        "local-output.mjs", "private-storage.mjs",
+        "local-output.mjs", "private-storage.mjs", "windows-ocr.mjs",
         "assistant/bridge.mjs", "connectors/microsoft365.mjs", "connectors/safe-file-download.mjs"
       ] },
       { "from": "../public", "to": "workspace/public", "filter": [
-        "index.html", "styles.css", "app.js", "task-board.mjs"
+        "index.html", "styles.css", "app.js", "task-board.mjs", "account-search.mjs", "account-workspace.mjs", "outcome-import-workflow.mjs"
       ] }
     ],
     "win": {

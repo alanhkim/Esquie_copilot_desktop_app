@@ -3,8 +3,10 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import vm from 'node:vm';
 import { laneMove, matchingTasks } from '../public/task-board.mjs';
+import { createTextElement } from '../public/account-workspace.mjs';
 
 class Element {
+  dataset = {};
   children = [];
   listeners = {};
   attributes = {};
@@ -27,7 +29,7 @@ async function board() {
     }
   };
   const context = vm.createContext({
-    document, laneMove, matchingTasks, URLSearchParams,
+    document, laneMove, matchingTasks, createTextElement, URLSearchParams,
     crypto: { randomUUID: () => 'fake-request' }, location: { hash: '' },
     sessionStorage: { getItem: () => null }
   });
@@ -124,5 +126,5 @@ test('rendering, search, lane selection and cancelled drag do not mutate status;
   elements.get('#task-search').value = 'no match';
   context.draw(state);
   assert.equal(context.calls.length, 2);
-  assert.equal(document.querySelector('#task-list').children[0].textContent, 'No tasks match that search.');
+  assert.equal(document.querySelector('#task-list').children[0].textContent, 'No tasks match that search or account filter.');
 });

@@ -70,7 +70,7 @@ h1 em { color: var(--green); font-weight: 400; }
 .overview div:nth-child(3) strong { color: #7b8b77; }
 .overview span { color: var(--muted); font-size: 10px; }
 .overview p { margin: 0 0 0 auto; color: #8b887f; font-size: 10px; }
-.toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 13px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; align-items: center; margin-bottom: 13px; }
 .search { height: 38px; width: min(390px, 60%); display: flex; align-items: center; gap: 9px; padding: 0 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: #8a897f; }
 .search input { width: 100%; border: 0; outline: 0; background: transparent; color: var(--ink); font-size: 11px; }
 .check { display: flex; align-items: center; gap: 8px; color: #77766e; font-size: 11px; }
@@ -140,6 +140,13 @@ input[type="checkbox"] { accent-color: var(--green); }
 .inline-check { display: flex !important; align-items: center; gap: 10px !important; }
 .inline-check input { width: auto; }
 .records-list { margin-top: 16px; }
+.records-toolbar { justify-content: flex-start; gap: 16px; margin: 18px 0 0; }
+.account-detail-heading { margin: 13px 0 4px; font-size: 11px; }
+.draft-card .account-detail { margin-top: 0; color: #565750; font-size: 11px; line-height: 1.6; }
+.account-history { margin: 13px 0; border-top: 1px solid var(--line); padding-top: 10px; }
+.account-history summary { color: var(--green-dark); cursor: pointer; font-size: 11px; font-weight: 650; }
+.account-history .conversation-messages { margin-top: 10px; }
+.account-note-form { margin-top: 13px; padding-top: 12px; border-top: 1px solid var(--line); }
 .conversation-messages { display: grid; gap: 10px; max-height: 260px; overflow-y: auto; }
 .note-bubble { padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #f6f7f1; }
 .note-bubble small { font-size: 10px; color: var(--muted); }
@@ -209,4 +216,5 @@ dialog .form { padding: 23px; }
 .source-preview { margin-top: 12px; }
 .source-preview summary { cursor: pointer; font-weight: 600; }
 .source-excerpt { white-space: pre-wrap; overflow-wrap: anywhere; }
+.source-content { max-height: 55vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 "Segoe UI", Arial, sans-serif; }
 #outlook-draft-form { grid-column: 1 / -1; }

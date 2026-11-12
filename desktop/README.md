@@ -29,19 +29,31 @@ Some npm installations restrict dependency install scripts or downloads. Follow
 local policy for the required Electron installation; do not bypass organizational
 restrictions. Run `npm audit` using an available advisory endpoint before release.
 
-Validation caveat: earlier install/rebuild commands relaxed npm remote/script
-restrictions. Observed graphical/build results used artifacts with unverified
-policy provenance, not a clean policy-compliant install. Do not reuse,
-distribute or publish those artifacts; existing artifacts/caches are left
-untouched. The later portable-lockfile restore without lifecycle scripts is
-separate and does not establish a fresh complete desktop installation.
-See the [validation record](../docs/parity-report.md) for precise limits.
+## Scoped desktop verification
 
-A separate fresh `npm ci --no-audit --no-fund` under existing policy exited 0, but
-npm blocked the `electron-winstaller@5.4.0` install script under its existing
-`allowScripts` policy. A complete desktop installation, runtime and installer
-remain unverified. No script approval or policy bypass was attempted for this
-fresh restore; exit 0 does not establish a fully installed desktop.
+The coordinator separately verified exactly
+`a5fdb1a6f369ab7d3f733aa8f94c58e25d54a6ba`, not later commits. An isolated
+`npm ci --no-audit --no-fund` exited 0 under unchanged settings, while existing
+`allowScripts` policy blocked `electron-winstaller@5.4.0`'s Squirrel-only
+lifecycle script. The configured NSIS target uses a separate builder path;
+the blocked script was neither invoked nor approved. Do not describe this
+restore as fully lifecycle-complete.
+
+At that checkpoint, 7/7 desktop tests, synthetic and actual Electron startup,
+package boundary checks and the unsigned NSIS build passed. Two independent
+launches against a fake workspace preserved a task and displayed disconnected
+Outlook. No older unverified artifacts were used or published. The installer
+was not executed: install/upgrade/uninstall, autostart and native tray-menu
+clicks remain unverified. Later Node host/resource checks do not extend this
+native-runtime evidence to a later revision.
+
+Earlier install/rebuild commands relaxed npm remote/script restrictions.
+Their older graphical/build artifacts have unverified policy provenance:
+do not reuse, distribute or publish them; existing artifacts/caches are left
+untouched. The clean checkpoint does not retroactively approve those artifacts
+or resolve the six-moderate npm audit summary. The earlier portable-lockfile
+restore without lifecycle scripts is another separate result. See the
+[validation record](../docs/parity-report.md) for precise limits.
 
 `dist` builds a local unsigned per-user NSIS installer; it does not publish.
 Install the generated `dist\Esquie-Local-Setup-0.1.0-x64.exe` interactively.
@@ -51,7 +63,9 @@ Quit the app before updating. There is no automatic update service or download.
 Build from a trusted source tree: the package includes this repository's `src`
 and `public` runtime files via an explicit allowlist, not a pre-existing workspace
 or reference installation. Update the allowlist and packaging regression test
-when the backend introduces a new runtime module or dashboard asset.
+when the backend introduces a new runtime module or dashboard asset. The account
+search and workspace modules are literal packaged assets; the resource check
+copies the allowlisted files and verifies that both module URLs are served.
 
 Workspace data is stored in `%LOCALAPPDATA%\EsquieLocal\Workspace`, outside the
 installation. Program updates and normal uninstall do not delete it. Back it up
@@ -86,8 +100,9 @@ without Electron/build artifacts. Missing imported runtime modules fail this
 check; it does not replace a real policy-compliant package/install validation.
 The allowlist includes the task-board browser ES module and the backend's
 `connectors/safe-file-download.mjs` import. Packaging these files does not enable
-selected content in the app: no content UI/sign-in is supplied, and the default
-Windows downloader deliberately remains unavailable.
+live selected content: explicit content UI is supplied, but no production
+sign-in is installed and the default Windows downloader deliberately remains
+unavailable.
 
 ## Integration and limitations
 

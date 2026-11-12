@@ -1,6 +1,6 @@
 const statuses = new Set(['next', 'doing', 'waiting', 'done']);
 
-export function matchingTasks(tasks, conversations, query, showDone) {
+export function matchingTasks(tasks, conversations, query, showDone, accountFilter = '') {
   const needle = query.trim().toLocaleLowerCase();
   const notes = new Map();
   for (const message of conversations) {
@@ -11,6 +11,8 @@ export function matchingTasks(tasks, conversations, query, showDone) {
   }
   return tasks.filter(task => {
     if (!showDone && task.status === 'done') return false;
+    if (accountFilter === 'unassigned' && task.accountId) return false;
+    if (accountFilter && accountFilter !== 'unassigned' && task.accountId !== accountFilter) return false;
     const text = [
       task.title, task.details, ...(notes.get(task.id) || []),
       ...(task.evidence || []).flatMap(item => [item.title, item.note, item.url])

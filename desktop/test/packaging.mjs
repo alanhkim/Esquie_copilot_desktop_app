@@ -17,10 +17,10 @@ const electron = dirname(require.resolve('electron/package.json'));
 const electronDist = join(electron, 'dist');
 const expected = [
   'src/server.mjs', 'src/store.mjs', 'src/worker.mjs', 'src/backups.mjs', 'src/monthly-outcomes-import.mjs',
-  'src/local-output.mjs', 'src/private-storage.mjs', 'src/assistant/bridge.mjs',
+  'src/local-output.mjs', 'src/private-storage.mjs', 'src/windows-ocr.mjs', 'src/assistant/bridge.mjs',
   'src/connectors/microsoft365.mjs', 'src/connectors/safe-file-download.mjs',
   'public/index.html', 'public/styles.css', 'public/app.js',
-  'public/task-board.mjs'
+  'public/task-board.mjs', 'public/account-search.mjs', 'public/account-workspace.mjs', 'public/outcome-import-workflow.mjs'
 ];
 const sentinels = [
   'src/private-sentinel.txt', 'src/private-sentinel.mjs',

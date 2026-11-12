@@ -2,9 +2,7 @@ import { execFile } from 'node:child_process';
 import { lstat, readdir, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 
-const execute = promisify(execFile);
 const failure = 'Current-user-only storage protection could not be verified. Use a protected local folder; existing data and existing permissions were not replaced.';
 const names = ['workspace.sqlite', 'workspace.sqlite-wal', 'workspace.sqlite-shm', 'workspace.sqlite-journal', 'workspace.owner', 'workspace.json', 'workspace.lock', 'esquie-launch.html', 'documents', 'backups', 'recoveries'];
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -32,23 +30,81 @@ export function assertPrivateDataDirectory(path) {
   }
   return candidate;
 }
+const allowedPowerShellEnvironment = new Set(['ESQUIE_STORAGE_CHECK_PATH', 'ESQUIE_STORAGE_CREATE_PRIVATE', 'ESQUIE_IDENTITY_DRIVE']);
 
-export function runSystemPowerShell(script, environment = {}) {
+export function systemPowerShellPath() {
   const systemRoot = process.env.SystemRoot;
-  if (!systemRoot || !/^[a-z]:\\/i.test(systemRoot)) throw new Error('The system PowerShell installation cannot be verified.');
+  if (process.platform !== 'win32' || !systemRoot || !/^[a-z]:\\/i.test(systemRoot)) {
+    throw new Error('The system PowerShell installation cannot be verified.');
+  }
   const system32 = join(systemRoot, 'System32');
   const powerShell = join(system32, 'WindowsPowerShell', 'v1.0');
-  return execute(join(powerShell, 'powershell.exe'), [
-    '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')
-  ], {
-    timeout: 15_000, windowsHide: true,
-    env: {
-      SystemRoot: systemRoot, WINDIR: systemRoot,
-      PATH: `${system32};${powerShell}`, PSModulePath: join(powerShell, 'Modules'),
-      ...(process.env.TEMP ? { TEMP: process.env.TEMP } : {}),
-      ...(process.env.TMP ? { TMP: process.env.TMP } : {}),
-      ...environment
+  return {
+    executable: join(powerShell, 'powershell.exe'),
+    environment: {
+      SystemRoot: systemRoot,
+      WINDIR: systemRoot,
+      PATH: `${system32};${powerShell}`,
+      PSModulePath: join(powerShell, 'Modules')
     }
+  };
+}
+
+export function runSystemPowerShell(script, environment = {}, {
+  input = '',
+  timeoutMs = 15_000,
+  maxBuffer = 1_000_000,
+  signal,
+  includeTemp = true,
+  onSpawn
+} = {}) {
+  if (Object.entries(environment).some(([key, value]) => !allowedPowerShellEnvironment.has(key) || typeof value !== 'string')) {
+    throw new Error('The PowerShell environment contains unsupported settings.');
+  }
+  const { executable, environment: baseEnvironment } = systemPowerShellPath();
+  const systemRoot = baseEnvironment.SystemRoot;
+  const env = {
+    ...baseEnvironment,
+    ...(includeTemp && process.env.TEMP ? { TEMP: process.env.TEMP } : {}),
+    ...(includeTemp && process.env.TMP ? { TMP: process.env.TMP } : {}),
+    ...environment
+  };
+  const args = ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')];
+
+  return new Promise((resolveResult, rejectResult) => {
+    let inputError = null;
+    const child = execFile(executable, args, {
+      windowsHide: true,
+      timeout: timeoutMs,
+      maxBuffer,
+      signal,
+      env: { ...env, SystemRoot: systemRoot, WINDIR: systemRoot }
+    }, (error, stdout, stderr) => {
+      if (inputError) {
+        inputError.stdout = stdout;
+        inputError.stderr = stderr;
+        rejectResult(inputError);
+        return;
+      }
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        rejectResult(error);
+      } else resolveResult({ stdout, stderr });
+    });
+    child.stdin.once('error', error => {
+      inputError = error;
+      if (!child.killed) child.kill();
+    });
+    if (onSpawn) {
+      try { onSpawn(child); }
+      catch (error) {
+        child.kill();
+        rejectResult(error);
+        return;
+      }
+    }
+    child.stdin.end(input);
   });
 }
 
@@ -125,14 +181,16 @@ export async function assertPrivateStorage(root, { created = false } = {}) {
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || resolve(root) !== await realpath(root)) throw new Error(failure);
   if (process.platform === 'win32') {
     try {
-      const { stdout } = await runSystemPowerShell(windowsCheck, { ESQUIE_STORAGE_CHECK_PATH: root, ESQUIE_STORAGE_CREATE_PRIVATE: String(created) });
+      const { stdout } = await runSystemPowerShell(windowsCheck, { ESQUIE_STORAGE_CHECK_PATH: root, ESQUIE_STORAGE_CREATE_PRIVATE: String(created) }, { timeoutMs: 60_000 });
       if (JSON.parse(stdout).private !== true) throw new Error(failure);
     } catch (error) {
-      const reason = [
-        'New storage is not empty.', 'Redirected storage.', 'Unexpected document storage.', 'Unexpected backup storage.',
-        'Unverified storage owner.', 'Storage is shared with another principal.',
-        'An ancestor permits storage replacement.'
-      ].find(message => error.stderr?.includes(message)) || 'Permission inspection failed or is unavailable.';
+      const reason = error.code == null && error.killed === true && error.signal === 'SIGTERM'
+        ? 'Permission inspection was interrupted or timed out; retry when the system is less busy.'
+        : [
+          'New storage is not empty.', 'Redirected storage.', 'Unexpected document storage.', 'Unexpected backup storage.',
+          'Unverified storage owner.', 'Storage is shared with another principal.',
+          'An ancestor permits storage replacement.'
+        ].find(message => error.stderr?.includes(message)) || 'Permission inspection failed or is unavailable.';
       throw new Error(`${failure} ${reason}`);
     }
     return;

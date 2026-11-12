@@ -16,6 +16,7 @@ test('literal runtime resource allowlist forms a standalone backend without Elec
   ]);
   assert.ok(resources.find(resource => resource.to === 'workspace/public').filter.includes('task-board.mjs'));
   assert.ok(resources.find(resource => resource.to === 'workspace/src').filter.includes('connectors/safe-file-download.mjs'));
+  assert.ok(resources.find(resource => resource.to === 'workspace/src').filter.includes('windows-ocr.mjs'));
   for (const resource of resources) {
     assert.ok(Array.isArray(resource.filter) && resource.filter.length > 0);
     for (const file of resource.filter) {
@@ -38,8 +39,16 @@ test('literal runtime resource allowlist forms a standalone backend without Elec
     assert.equal((await fetch(`${app.url}/api/health`)).ok, true);
     assert.equal((await fetch(`${app.url}/api/state`)).status, 401);
     assert.equal((await fetch(`${app.url}/api/state`, { headers: { 'X-Esquie-Access': app.accessToken } })).ok, true);
-    for (const asset of ['/', '/app.js', '/styles.css', '/task-board.mjs']) {
-      assert.equal((await fetch(`${app.url}${asset}`)).ok, true, asset);
+    for (const asset of ['/', '/app.js', '/styles.css', '/task-board.mjs', '/account-search.mjs', '/account-workspace.mjs', '/outcome-import-workflow.mjs']) {
+      const response = await fetch(`${app.url}${asset}`);
+      assert.equal(response.ok, true, asset);
+      if (asset.endsWith('.mjs')) {
+        assert.deepEqual(
+          Buffer.from(await response.arrayBuffer()),
+          await readFile(resolve(desktop, '..', 'public', asset.slice(1))),
+          `${asset} must serve the exact allowlisted module.`
+        );
+      }
     }
     const module = await fetch(`${app.url}/task-board.mjs`);
     assert.match(module.headers.get('content-type'), /^text\/javascript(?:;|$)/);

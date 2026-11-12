@@ -74,6 +74,8 @@ test('legacy tasks keep known creation dates/completed state and never receive i
   let state = await context.state();
   assert.equal(state.tasks[0].status, 'done');
   assert.equal(state.tasks[0].createdAt, undefined);
+  assert.equal(state.tasks[0].accountId, undefined);
+  assert.equal(matchingTasks(state.tasks, state.conversations, '', true, 'unassigned').length, 2);
   assert.deepEqual(state.tasks[0].history, []);
   assert.deepEqual(state.tasks[0].evidence, [legacyEvidence]);
   assert.equal(Object.hasOwn(state.tasks[0].evidence[0], 'sourceReference'), false);
@@ -110,4 +112,48 @@ test('local lane moves persist history, reject stale revisions and preserve comp
   const reopened = await (await patch(laneMove(state.tasks[0], 'doing'))).json();
   assert.equal(reopened.task.completedAt, null);
   assert.deepEqual(reopened.task.history.map(event => event.kind), ['created', 'status-changed', 'completed', 'note-added', 'evidence-added', 'reopened']);
+});
+
+test('explicit account IDs persist without name inference, preserve completed work and reject invalid or stale edits atomically', async t => {
+  const context = await setup(t);
+  const record = async category => (await (await context.request('/api/records', { category, title: 'Same fake account' })).json()).record;
+  const first = await record('account');
+  const second = await record('account');
+  const outcome = await record('outcome');
+  const create = async body => context.request('/api/tasks', { title: 'Same fake account', details: first.title, ...body });
+  let task = (await (await create({ accountId: first.id, status: 'done' })).json()).task;
+  const noSelection = (await (await create({})).json()).task;
+  assert.equal(noSelection.accountId, '');
+  const before = await context.state();
+  for (const accountId of [null, 17, {}, [], false, 'Same fake account', ' ', first.id.toUpperCase(), randomUUID(), outcome.id]) {
+    assert.equal((await create({ accountId })).status, 400);
+    assert.equal((await context.request(`/api/tasks/${task.id}`, { accountId, title: 'Must not persist', revision: task.revision }, 'PATCH')).status, 400);
+  }
+  assert.deepEqual((await context.state()).tasks, before.tasks);
+  const staleRevision = task.revision;
+  const completedAt = task.completedAt;
+  task = (await (await context.request(`/api/tasks/${task.id}`, { accountId: second.id, revision: task.revision }, 'PATCH')).json()).task;
+  assert.equal(task.status, 'done');
+  assert.equal(task.completedAt, completedAt);
+  assert.deepEqual(task.history.at(-1).fields, ['accountId']);
+  assert.equal((await context.request(`/api/tasks/${task.id}`, { accountId: first.id, revision: staleRevision }, 'PATCH')).status, 409);
+  const renamed = await context.request(`/api/records/${second.id}`, { category: 'account', title: 'Renamed fake account', revision: second.revision }, 'PATCH');
+  assert.equal(renamed.status, 200);
+  task = (await (await context.request(`/api/tasks/${task.id}`, { title: 'Renamed fake task', revision: task.revision }, 'PATCH')).json()).task;
+  assert.equal(task.accountId, second.id, 'unrelated edits and account renames preserve the exact association');
+  await context.request(`/api/tasks/${task.id}/conversation`, { text: 'Fake account note needle' });
+  await context.restart();
+  const state = await context.state();
+  task = state.tasks.find(item => item.id === task.id);
+  assert.equal(task.accountId, second.id);
+  assert.equal(state.records.find(item => item.id === task.accountId).title, 'Renamed fake account');
+  assert.equal(task.status, 'done');
+  assert.deepEqual(matchingTasks(state.tasks, state.conversations, 'needle', false, second.id), []);
+  assert.deepEqual(matchingTasks(state.tasks, state.conversations, 'needle', true, first.id), []);
+  assert.equal(matchingTasks(state.tasks, state.conversations, 'needle', true, second.id)[0].id, task.id);
+  assert.equal(matchingTasks(state.tasks, state.conversations, first.title, true, 'unassigned')[0].id, noSelection.id);
+  task = (await (await context.request(`/api/tasks/${task.id}`, { accountId: '', revision: task.revision }, 'PATCH')).json()).task;
+  assert.equal(task.accountId, '');
+  assert.equal(task.status, 'done');
+  assert.equal(task.completedAt, completedAt);
 });

@@ -271,6 +271,48 @@ test('missing status is preserved as not provided instead of assumed delivered',
   assert.match(saved.note, /^Status: Not provided$/);
 });
 
+test('OCR provenance is owner-stated, unverified, and bound to the reviewed preview', async t => {
+  const context = await setup(t);
+  const preview = await (await context.post('/api/outcomes/import/preview', {
+    text: table, sourceMethod: 'screenshot-ocr'
+  })).json();
+  assert.equal(preview.sourceMethod, 'screenshot-ocr');
+  const changedMethod = await context.post('/api/outcomes/import/confirm', {
+    text: table, revision: preview.revision, textHash: preview.textHash,
+    sourceMethod: 'screenshot-ocr-edited', sourceMethodHash: preview.sourceMethodHash, reviewed: true
+  });
+  assert.equal(changedMethod.status, 409);
+  assert.equal((await context.state()).records.length, 0);
+
+  const missingBinding = await context.post('/api/outcomes/import/confirm', {
+    text: table, revision: preview.revision, textHash: preview.textHash,
+    sourceMethod: 'screenshot-ocr', reviewed: true
+  });
+  assert.equal(missingBinding.status, 409);
+  assert.equal((await context.state()).records.length, 0);
+
+  const confirmed = await context.post('/api/outcomes/import/confirm', {
+    text: table, revision: preview.revision, textHash: preview.textHash,
+    sourceMethod: preview.sourceMethod, sourceMethodHash: preview.sourceMethodHash, reviewed: true
+  });
+  assert.equal(confirmed.status, 200);
+  assert.equal((await context.state()).records[0].provenance, 'owner-stated-screenshot-ocr-unverified');
+
+  const editedText = table.replace('2020-10-12', '2020-10-13');
+  const editedPreview = await (await context.post('/api/outcomes/import/preview', {
+    text: editedText, sourceMethod: 'screenshot-ocr-edited'
+  })).json();
+  const editedConfirm = await context.post('/api/outcomes/import/confirm', {
+    text: editedText, revision: editedPreview.revision, textHash: editedPreview.textHash,
+    sourceMethod: editedPreview.sourceMethod, sourceMethodHash: editedPreview.sourceMethodHash, reviewed: true
+  });
+  assert.equal(editedConfirm.status, 200);
+  await context.restart();
+  const savedRecords = (await context.state()).records;
+  assert.equal(savedRecords[0].provenance, 'owner-stated-screenshot-ocr-edited-unverified');
+  assert.equal(savedRecords[1].provenance, 'owner-stated-screenshot-ocr-unverified');
+});
+
 test('multilingual imports above 20,000 JSON bytes work without enlarging other API limits', async t => {
   const context = await setup(t);
   const note = '漢'.repeat(3500);

@@ -48,6 +48,13 @@ function normalizeState(value) {
   for (const key of ['links', 'conversations', 'jobs', 'documents', 'records', 'draftOperations', 'backups', 'recoveries']) {
     if (!Array.isArray(state[key])) throw new Error(`Saved ${key} is invalid; the workspace was left unchanged.`);
   }
+  for (const record of state.records) {
+    if (record.category !== 'account') continue;
+    if (record.history != null && !Array.isArray(record.history)) throw new Error('Saved account history is invalid; the workspace was left unchanged.');
+    record.history ??= [];
+    record.plan ??= '';
+    record.stakeholders ??= '';
+  }
   if (!state.profile || typeof state.profile !== 'object' || Array.isArray(state.profile)) throw new Error('Saved profile is invalid.');
   state.preferences = { ...newWorkspace().preferences, ...state.preferences };
   return state;

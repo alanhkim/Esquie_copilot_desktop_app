@@ -12,6 +12,27 @@ import { startServer } from '../src/server.mjs';
 import { createWorker, enqueue, quietHoursActive } from '../src/worker.mjs';
 import { newWorkspace } from '../src/store.mjs';
 
+const sourceIdentity = { tenantId: 'synthetic-tenant', userId: 'synthetic-owner' };
+const chatSelection = {
+  consent: true, expectedIdentity: sourceIdentity, allowReplyDrafts: false,
+  sources: { chats: ['synthetic-chat'] }
+};
+const microsoft365Options = {
+  tokenProvider: async ({ scopes }) => ({
+    ...sourceIdentity, accessToken: 'synthetic-worker-token', tokenType: 'delegated', scopes
+  }),
+  transport: async target => {
+    assert.equal(new URL(target).pathname, '/v1.0/me');
+    return Response.json({ id: sourceIdentity.userId });
+  }
+};
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(complete => { resolve = complete; });
+  return { promise, resolve };
+}
+
 async function setup(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'esquie-queue-'));
   let app = await startServer({ dataDir: root, port: 0, workerIntervalMs: 0, verifyLocalVolume: async () => true, ...options });
@@ -126,13 +147,17 @@ test('pause and timezone-aware quiet hours defer the worker and persist preferen
 });
 
 test('bounded source reads with synthetic identity verification are partial, never a full sync', async t => {
-  const context = await setup(t, { connectors: { teamsChats: { read: async () => ({ items: [{ id: 'fake' }], verifiedOwner: true, coverage: { status: 'bounded', limitations: ['one-test-page'] } }) } } });
+  const context = await setup(t, {
+    microsoft365Options,
+    connectors: { teamsChats: { read: async () => ({ items: [{ id: 'fake' }], verifiedOwner: true, coverage: { status: 'bounded', limitations: ['one-test-page'] } }) } }
+  });
+  assert.equal((await context.request('/api/microsoft365/connect', chatSelection)).status, 200);
   await context.request('/api/jobs', { kind: 'source_refresh', requestId: randomUUID() });
   await context.app.worker.tick();
   const job = (await context.state()).jobs[0];
   assert.equal(job.status, 'partial');
   assert.equal(job.result.sources.find(source => source.source === 'teamsChats').inspected, 1);
-  assert.equal(job.result.sources.find(source => source.source === 'mail').status, 'disconnected');
+  assert.equal(job.result.sources.find(source => source.source === 'mail').status, 'unavailable');
 });
 
 test('scheduled attempts are opt-in and limited to one every thirty minutes, including empty verified reads', async t => {
@@ -140,10 +165,12 @@ test('scheduled attempts are opt-in and limited to one every thirty minutes, inc
   let reads = 0;
   const context = await setup(t, {
     clock: () => now,
+    microsoft365Options,
     connectors: { teamsChats: { read: async () => { reads++; return { items: [], verifiedOwner: true, coverage: { status: 'bounded', limitations: ['empty-bounded-page'] } }; } } }
   });
   await context.app.worker.tick();
   assert.equal((await context.state()).jobs.length, 0);
+  assert.equal((await context.request('/api/microsoft365/connect', chatSelection)).status, 200);
   await context.request('/api/profile', { timezone: 'UTC' }, 'PATCH');
   await context.request('/api/preferences', { automaticRefresh: true }, 'PATCH');
   await context.app.worker.tick();
@@ -155,6 +182,287 @@ test('scheduled attempts are opt-in and limited to one every thirty minutes, inc
   await context.app.worker.tick();
   assert.equal(reads, 2);
   assert.equal((await context.state()).jobs.length, 2);
+});
+
+test('pause, quiet-hours transition, and shutdown discard the active read but retain earlier source results', async t => {
+  for (const reason of ['paused', 'quiet_hours', 'shutdown']) {
+    await t.test(reason, async t => {
+      let now = new Date('2026-11-11T11:00:00Z');
+      const readStarted = deferred();
+      const abortObserved = deferred();
+      const finishRead = deferred();
+      const reads = { mail: 0, calendar: 0, teamsChats: 0 };
+      const context = await setup(t, {
+        clock: () => new Date(now.valueOf()),
+        microsoft365Options,
+        connectors: {
+          mail: { read: async () => {
+            reads.mail++;
+            return { items: [{ id: 'synthetic-mail' }], verifiedOwner: true, coverage: { status: 'bounded' } };
+          } },
+          calendar: { read: async ({ signal }) => {
+            reads.calendar++;
+            signal.addEventListener('abort', () => abortObserved.resolve(), { once: true });
+            readStarted.resolve();
+            await finishRead.promise;
+            return { items: [{ id: 'synthetic-late-event' }], verifiedOwner: true, coverage: { status: 'bounded' } };
+          } },
+          teamsChats: { read: async () => {
+            reads.teamsChats++;
+            return { items: [], verifiedOwner: true, coverage: { status: 'bounded' } };
+          } }
+        }
+      });
+      assert.equal((await context.request('/api/profile', { timezone: 'UTC' }, 'PATCH')).status, 200);
+      assert.equal((await context.request('/api/microsoft365/connect', {
+        consent: true, expectedIdentity: sourceIdentity, allowReplyDrafts: false,
+        sources: { mail: true, calendar: true, chats: ['synthetic-chat'] }
+      })).status, 200);
+      if (reason === 'quiet_hours') {
+        assert.equal((await context.request('/api/preferences', {
+          quietStart: '12:00', quietEnd: '13:00'
+        }, 'PATCH')).status, 200);
+      }
+
+      await context.request('/api/jobs', { kind: 'source_refresh', requestId: randomUUID() });
+      const tick = context.app.worker.tick();
+      await readStarted.promise;
+      let stopping;
+      if (reason === 'paused') {
+        assert.equal((await context.request('/api/preferences', { paused: true }, 'PATCH')).status, 200);
+      } else if (reason === 'quiet_hours') {
+        now = new Date('2026-11-11T12:05:00Z');
+      } else {
+        stopping = context.app.worker.stop();
+      }
+      await abortObserved.promise;
+      finishRead.resolve();
+      await tick;
+      if (stopping) await stopping;
+
+      const job = (await context.state()).jobs[0];
+      assert.equal(job.status, 'partial', 'earlier completed evidence remains, but the cancelled active read is not retained');
+      const mail = job.result.sources.find(source => source.source === 'mail');
+      const calendar = job.result.sources.find(source => source.source === 'calendar');
+      assert.equal(mail.status, 'partial');
+      assert.equal(mail.items[0].id, 'synthetic-mail');
+      assert.equal(calendar.status, 'deferred');
+      assert.equal(calendar.items, undefined);
+      assert.equal(job.result.sources.find(source => source.source === 'teamsChats').status, 'deferred');
+      assert.doesNotMatch(JSON.stringify(job.result), /synthetic-late-event/);
+      assert.match(job.result.text, /Source checks stopped by/);
+      assert.deepEqual(reads, { mail: 1, calendar: 1, teamsChats: 0 });
+    });
+  }
+});
+
+test('refresh discards earlier and late evidence after owner, consent or connection changes despite ignored abort', async t => {
+  for (const change of ['owner', 'consent', 'connection']) await t.test(change, async t => {
+    const state = newWorkspace();
+    const store = { state, update: update => update(state) };
+    let owner = sourceIdentity;
+    let authorization = 'synthetic-current-authorization';
+    let epoch = 'synthetic-current-epoch';
+    const entered = deferred();
+    const release = deferred();
+    const evidence = id => ({ verifiedOwner: true, items: [{ id, text: 'synthetic-sensitive-preview' }], coverage: { successfulRequests: 1, gaps: [] } });
+    const worker = createWorker({
+      store, intervalMs: 0, sourceIdentity: () => owner, sourceAuthorization: () => authorization, sourceEpoch: () => epoch,
+      connectors: {
+        mail: { read: async () => evidence('synthetic-sensitive-early') },
+        calendar: { read: async () => { entered.resolve(); await release.promise; return evidence('synthetic-sensitive-late'); } }
+      }
+    });
+    t.after(async () => { release.resolve(); await worker.stop(); });
+    const job = enqueue(state, { kind: 'source_refresh', requestId: randomUUID() });
+    const running = worker.tick();
+    try {
+      await Promise.race([entered.promise, running.then(() => assert.fail('Expected delayed second source.'))]);
+      if (change === 'owner') owner = { ...sourceIdentity, userId: 'synthetic-new-owner' };
+      if (change === 'consent') authorization = 'synthetic-replaced-authorization';
+      if (change === 'connection') epoch = 'synthetic-new-epoch';
+    } finally {
+      release.resolve();
+      await running;
+    }
+    assert.equal(job.status, 'failed');
+    assert.equal(job.result.sources.find(source => source.source === 'mail').status, 'deferred');
+    assert.equal(job.result.sources.find(source => source.source === 'calendar').status, 'deferred');
+    assert.doesNotMatch(JSON.stringify(job.result), /synthetic-sensitive/);
+    for (const source of job.result.sources) assert.equal(source.items, undefined);
+  });
+});
+
+test('meeting list retention rejects stale authorization and late results after lifecycle controls', async t => {
+  for (const change of ['owner', 'consent', 'revocation', 'connection', 'paused', 'quiet_hours', 'shutdown', 'paused-revocation', 'shutdown-owner-change', 'paused-before-retention', 'quiet_hours-before-retention', 'shutdown-before-retention']) await t.test(change, async t => {
+    const state = newWorkspace();
+    state.profile.timezone = 'UTC';
+    let now = new Date('2026-11-11T11:00:00Z');
+    if (change.startsWith('quiet_hours')) Object.assign(state.preferences, { quietStart: '12:00', quietEnd: '13:00' });
+    const store = { state, update: update => update(state) };
+    let owner = sourceIdentity;
+    let authorization = 'synthetic-list-authorization';
+    let epoch = 'synthetic-list-epoch';
+    const entered = deferred();
+    const release = deferred();
+    const health = [];
+    let stopping;
+    const worker = createWorker({
+      store, intervalMs: 0, clock: () => now, sourceIdentity: () => owner,
+      sourceAuthorization: () => authorization, sourceEpoch: () => epoch,
+      onSourceResult: result => {
+        health.push(result);
+        if (result.status !== 'partial') return;
+        if (change === 'paused-before-retention') state.preferences.paused = true;
+        if (change === 'quiet_hours-before-retention') now = new Date('2026-11-11T12:05:00Z');
+        if (change === 'shutdown-before-retention') stopping = worker.stop();
+      },
+      insightListConnector: { read: async ({ checkpoint }) => {
+        assert.equal(checkpoint(), true);
+        entered.resolve();
+        await release.promise;
+        return { verifiedOwner: true, items: [{ id: 'synthetic-sensitive-list-id' }], coverage: { successfulRequests: 1, gaps: [] } };
+      } }
+    });
+    t.after(async () => { release.resolve(); await worker.stop(); });
+    const job = enqueue(state, { kind: 'meeting_insight_list', requestId: randomUUID(), payload: {
+      meetingId: 'synthetic-meeting', ownerReference: JSON.stringify(owner), connectionEpoch: epoch
+    } });
+    const next = enqueue(state, { kind: 'source_refresh', requestId: randomUUID() });
+    const running = worker.tick();
+    try {
+      await Promise.race([entered.promise, running.then(() => assert.fail('Expected delayed list read.'))]);
+      if (change === 'owner') owner = { ...sourceIdentity, userId: 'synthetic-new-owner' };
+      if (change === 'consent') authorization = 'synthetic-replaced-authorization';
+      if (change === 'revocation') authorization = null;
+      if (change === 'connection') epoch = 'synthetic-new-epoch';
+      if (change === 'paused') { state.preferences.paused = true; worker.cancelCurrent('paused'); }
+      if (change === 'quiet_hours') { now = new Date('2026-11-11T12:05:00Z'); worker.cancelCurrent('quiet_hours'); }
+      if (change === 'shutdown') stopping = worker.stop();
+      if (change === 'paused-revocation') { state.preferences.paused = true; worker.cancelCurrent('paused'); authorization = null; }
+      if (change === 'shutdown-owner-change') { stopping = worker.stop(); owner = { ...sourceIdentity, userId: 'synthetic-new-owner' }; }
+    } finally {
+      release.resolve();
+      await running;
+      if (stopping) await stopping;
+    }
+    assert.equal(job.status, 'failed');
+    assert.equal(job.result, null);
+    assert.doesNotMatch(JSON.stringify(job), /synthetic-sensitive-list-id/);
+    assert.equal(health.at(-1).status, 'deferred');
+    assert.equal(health.at(-1).inspected, 0);
+    if (['paused', 'quiet_hours', 'shutdown', 'paused-revocation', 'shutdown-owner-change'].includes(change) || change.endsWith('-before-retention')) {
+      await worker.tick();
+      assert.equal(next.status, 'queued', 'no later read starts under the control');
+    }
+  });
+});
+
+test('refresh rejects its latest read when lifecycle changes immediately before job retention', async t => {
+  for (const change of ['paused', 'quiet_hours', 'shutdown']) await t.test(change, async t => {
+    const state = newWorkspace();
+    state.profile.timezone = 'UTC';
+    let now = new Date('2026-11-11T11:00:00Z');
+    if (change === 'quiet_hours') Object.assign(state.preferences, { quietStart: '12:00', quietEnd: '13:00' });
+    const store = { state, update: update => update(state) };
+    const health = [];
+    let stopping;
+    const worker = createWorker({
+      store, intervalMs: 0, clock: () => now, sourceIdentity: () => sourceIdentity,
+      sourceAuthorization: () => 'synthetic-current-authorization',
+      connectors: { mail: { read: async () => ({ verifiedOwner: true, items: [{ id: 'synthetic-sensitive-before-retention' }] }) } },
+      onSourceResult: result => {
+        health.push(result);
+        if (result.status !== 'partial') return;
+        if (change === 'paused') state.preferences.paused = true;
+        if (change === 'quiet_hours') now = new Date('2026-11-11T12:05:00Z');
+        if (change === 'shutdown') stopping = worker.stop();
+      }
+    });
+    t.after(() => worker.stop());
+    const job = enqueue(state, { kind: 'source_refresh', requestId: randomUUID() });
+    await worker.tick();
+    if (stopping) await stopping;
+    assert.equal(job.status, 'failed');
+    assert.equal(job.result.sources[0].status, 'deferred');
+    assert.equal(health.filter(result => result.source === 'mail').at(-1).status, 'deferred');
+    assert.doesNotMatch(JSON.stringify(job.result), /synthetic-sensitive/);
+  });
+});
+
+test('selected replies and file content discard ignored-abort and pre-transition late results', async t => {
+  for (const kind of ['teams_channel_replies', 'file_content_read']) {
+    for (const phase of ['inflight', 'before-retention']) {
+      for (const change of phase === 'inflight' ? ['paused', 'quiet_hours', 'shutdown'] : ['paused', 'quiet_hours', 'shutdown', 'owner', 'consent', 'selection', 'connection']) await t.test(`${kind}: ${phase} ${change}`, async t => {
+        const state = newWorkspace();
+        state.profile.timezone = 'UTC';
+        let now = new Date('2026-11-11T11:00:00Z');
+        if (change === 'quiet_hours') Object.assign(state.preferences, { quietStart: '12:00', quietEnd: '13:00' });
+        const store = { state, update: update => update(state) };
+        let owner = sourceIdentity;
+        let authorization = 'synthetic-selected-authorization';
+        let epoch = 'synthetic-selected-epoch';
+        const content = 'synthetic-sensitive-selected-content';
+        let binding = {
+          ownerReference: JSON.stringify(owner), authorizationReference: authorization,
+          teamId: 'fake-team', channelId: 'fake-channel', messageId: 'fake-parent', parent: { id: 'fake-parent' },
+          driveId: 'fake-drive', itemId: 'fake-file', mimeType: 'text/plain', approvedHost: 'example.invalid',
+          eTag: '"fake-etag"', size: Buffer.byteLength(content)
+        };
+        const entered = deferred();
+        const release = deferred();
+        let stopping;
+        let changed = false;
+        const changeState = () => {
+          if (changed) return;
+          changed = true;
+          if (change === 'paused') state.preferences.paused = true;
+          if (change === 'quiet_hours') now = new Date('2026-11-11T12:05:00Z');
+          if (change === 'shutdown') stopping = worker.stop();
+          if (change === 'owner') owner = { ...sourceIdentity, userId: 'fake-new-owner' };
+          if (change === 'consent') authorization = null;
+          if (change === 'selection') binding = { ...binding, eTag: '"different-selection"' };
+          if (change === 'connection') epoch = 'fake-new-epoch';
+        };
+        const result = {
+          verifiedOwner: true, parent: { id: binding.messageId },
+          items: kind === 'file_content_read'
+            ? [{ driveId: binding.driveId, id: binding.itemId, mimeType: binding.mimeType, eTag: binding.eTag, size: binding.size, contentAvailable: true, contentType: 'text/plain', content }]
+            : [{ id: 'synthetic-sensitive-reply', replyToId: binding.messageId }],
+          get coverage() {
+            if (phase === 'before-retention') changeState();
+            return { status: 'partial', limitations: [] };
+          }
+        };
+        const read = async ({ checkpoint }) => {
+          assert.equal(Boolean(checkpoint()), true);
+          entered.resolve();
+          await release.promise;
+          return result;
+        };
+        const worker = createWorker({
+          store, intervalMs: 0, clock: () => now, sourceIdentity: () => owner, sourceAuthorization: () => authorization,
+          sourceEpoch: () => epoch, authorizeTeamsReply: () => binding, authorizeFileContent: () => binding,
+          fileContentAvailability: () => ({ readyForApprovedRead: true }),
+          connectors: { teamsChannels: { readReplies: read }, files: { readContent: read } }
+        });
+        t.after(async () => { release.resolve(); await worker.stop(); });
+        const job = enqueue(state, { kind, requestId: randomUUID(), payload: { sourceReference: {}, confirmRead: true } });
+        const running = worker.tick();
+        try {
+          await Promise.race([entered.promise, running.then(() => assert.fail('Expected delayed selected read.'))]);
+          if (phase === 'inflight') changeState();
+        } finally {
+          release.resolve();
+          await running;
+          if (stopping) await stopping;
+        }
+        assert.equal(job.status, 'failed');
+        assert.equal(job.result, null);
+        assert.doesNotMatch(JSON.stringify(job), /synthetic-sensitive/);
+      });
+    }
+  }
 });
 
 test('local document jobs use generated contained filenames and keep notes out of instructions', async t => {

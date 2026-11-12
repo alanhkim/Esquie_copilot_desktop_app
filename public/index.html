@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#f5f1eb">
   <title>Esquie — Your local workspace</title>
   <link rel="stylesheet" href="/styles.css">
-  <script src="/app.js" type="module"></script>
+  <script type="module" src="/app.js"></script>
 </head>
 <body>
   <div class="shell">
@@ -65,14 +65,15 @@
           <div><strong id="stat-open">0</strong><span>open tasks</span></div>
           <div><strong id="stat-waiting">0</strong><span>waiting</span></div>
           <div><strong id="stat-done">0</strong><span>completed</span></div>
-          <p>Tasks are saved on this device. No external sources are connected.</p>
+          <p>Tasks stay on this device. External sources require explicit authorization and show their current coverage in Connections.</p>
         </div>
         <div class="toolbar">
           <label class="search"><span>⌕</span><input id="task-search" type="search" placeholder="Find a task, note or evidence…" aria-label="Search tasks, notes and evidence"></label>
+          <label>Local account<select id="task-account-filter" aria-label="Filter tasks by local account"><option value="">All accounts</option><option value="unassigned">Unassigned</option></select></label>
           <label class="check"><input id="show-done" type="checkbox"> Show completed</label>
         </div>
         <div id="task-list" class="task-board" aria-live="polite"></div>
-        <footer class="footer">Changes stay in your local workspace. <span>External actions are not enabled.</span></footer>
+        <footer class="footer">Local changes stay in this workspace. <span>Only bounded reads and explicitly authorized unsent Outlook drafts are supported; messages are never sent.</span></footer>
       </section>
 
       <section id="view-ask" class="view" hidden>
@@ -102,6 +103,7 @@
             <label>Subject<input name="subject" required maxlength="240"></label>
             <label>Draft body<textarea name="body" required maxlength="12000" rows="10"></textarea></label>
             <button id="draft-save" class="button primary" type="submit">Save unsent draft</button>
+            <p data-save-status class="muted" role="status"></p>
           </form>
           <div class="surface">
             <div class="section-title"><h2>Saved drafts</h2><span id="draft-count" class="tag">0</span></div>
@@ -134,6 +136,7 @@
             <label>HTTP(S) URL<input name="url" required maxlength="2000" type="url" placeholder="https://example.invalid/page" autocomplete="off"></label>
             <p class="muted">Links are stored locally only. Esquie will not open or fetch them automatically.</p>
             <button class="button primary" type="submit">Save link</button>
+            <p data-save-status class="muted" role="status"></p>
           </form>
           <div class="surface"><div class="section-title"><h2>Saved links</h2><span id="link-count" class="tag">0</span></div><div id="link-list" class="draft-list"></div></div>
         </div>
@@ -149,19 +152,31 @@
       </section>
 
       <section id="view-operations" class="view" hidden>
-        <div class="page-heading"><div><p class="eyebrow">LOCAL SETTINGS</p><h1>Connections &amp; <em>boundaries.</em></h1><p>Unavailable sources are shown as disconnected; no sign-in or live data access is attempted.</p></div></div>
+        <div class="page-heading"><div><p class="eyebrow">LOCAL SETTINGS</p><h1>Connections &amp; <em>boundaries.</em></h1><p>Sources remain disconnected until you explicitly configure and authorize a supported host provider. Only bounded reads and unsent Outlook reply drafts are supported; no Teams writes or email sending are permitted.</p></div></div>
         <div id="connections" class="connection-grid"></div>
         <form id="microsoft365-form" class="surface form profile-form">
           <h2>Explicit Microsoft 365 connection</h2><p id="microsoft365-status">No authenticated host provider is configured.</p>
           <p>These IDs are not credentials and do not sign you in. The host must authenticate the same owner through an approved delegated provider. Do not enter tokens, secrets, or tenant configuration from another person.</p>
           <label>Your authenticated tenant ID<input name="tenantId" required maxlength="200" autocomplete="off"></label>
           <label>Your authenticated user object ID<input name="userId" required maxlength="200" autocomplete="off"></label>
-          <label>Explicit source selections as JSON<textarea name="sources" rows="6" required maxlength="12000" spellcheck="false">{"mail":false,"calendar":false,"chats":[],"channels":[],"transcripts":[],"files":[]}</textarea></label>
-          <p>Pin only your approved chat IDs, team/channel pairs, meeting/transcript pairs, and drive/item pairs. No discovery, uploads, Loop reader, or meeting AI-insights API is implied.</p>
+          <label>Explicit source selections as JSON<textarea name="sources" rows="6" required maxlength="12000" spellcheck="false">{"mail":false,"calendar":false,"chats":[],"channels":[],"transcripts":[],"oneNotePages":[],"meetingInsightMeetings":[],"meetingInsights":[],"files":[]}</textarea></label>
+          <p>Pin only your approved chat IDs, team/channel pairs, meeting/transcript pairs, meeting IDs for insight listing, meeting/insight pairs for detail, and drive/item pairs. Meeting insights are disabled by default; they require a Microsoft 365 Copilot license, supported work or school account, consent and an approved provider. Private scheduled meetings, town halls, webinars and Meet Now are supported; channel meetings are not. No meeting discovery, uploads or Loop reader is implied.</p>
+          <p>For a selected text/plain file read, add its exact owner-approved hostname as <code>approvedHost</code> (for example: <code>{"driveId":"example-drive","itemId":"example-item","approvedHost":"example.invalid"}</code>).</p>
+          <p id="file-content-status" class="muted">Selected file content status is unavailable until the host reports its current authentication and transport state.</p>
+          <p>Pin approved OneNote page IDs in <code>oneNotePages</code>. Only those pages are read through your own /me connection; HTML is literal inert text, never rendered or fetched. At most 600 characters are retained per page, with a 1 MiB response cap. No notebook discovery, continuation links or attachment reads.</p>
           <label class="inline-check"><input name="allowReplyDrafts" type="checkbox"> Separately allow unsent same-thread Outlook reply drafts. Never send or delete.</label>
           <label class="inline-check"><input name="consent" type="checkbox" required> I explicitly authorize these sources for my authenticated identity.</label>
           <button id="microsoft365-connect" type="submit" class="button" disabled>Verify owner and selected consent</button>
           <button id="microsoft365-disconnect" type="button" class="button">Disconnect and revoke this session</button>
+        </form>
+        <form id="meeting-insight-list-form" class="surface form profile-form">
+          <h2>List insight IDs for one meeting</h2>
+          <p>First add the exact meeting ID to meetingInsightMeetings and connect. This separately requested list returns at most 20 metadata records, not insight details. Results are historical local evidence; selecting a detail from a list is not yet supported.</p>
+          <label>Authorized meeting ID<input name="meetingId" required maxlength="2000" autocomplete="off"></label>
+          <label class="inline-check"><input name="listConsent" type="checkbox" required> I consent to list the first page for this meeting now.</label>
+          <button type="submit" class="button">Queue selected meeting list</button>
+          <button id="meeting-insight-list-reset" type="button" class="button" hidden>I've checked Activity; start a new request</button>
+          <p id="meeting-insight-list-status" role="status">No list requested.</p>
         </form>
         <form id="profile-form" class="surface form profile-form">
           <h2>Local workspace profile</h2>
@@ -175,9 +190,11 @@
           <label>Workspace name <span>a local label, not a filesystem move</span><input name="workspaceName" maxlength="160"></label>
           <label>Writing preferences<textarea name="writingStyle" maxlength="2000" rows="3"></textarea></label>
           <button class="button primary" type="submit">Save profile locally</button>
+          <p data-save-status class="muted" role="status"></p>
         </form>
         <form id="preferences-form" class="surface form profile-form">
           <h2>Worker preferences</h2>
+          <p id="worker-timezone-status" class="muted" role="status"></p>
           <label class="inline-check"><input name="paused" type="checkbox"> Pause local worker</label>
           <label class="inline-check"><input name="automaticRefresh" type="checkbox"> Attempt bounded source checks every 30 minutes</label>
           <label class="inline-check"><input name="dailyBackups" type="checkbox"> Attempt one private workspace backup daily while open</label>
@@ -218,8 +235,12 @@
         <div class="page-heading"><div><p class="eyebrow">A RECORD OF CUSTOMER IMPACT</p><h1>Monthly <em>Outcomes.</em></h1><p>Reporting is not configured. No business data has been queried.</p></div></div>
         <div class="empty-panel"><span class="tag">SOURCE REPORTING DISCONNECTED</span><h2>Record your own local outcomes</h2><p>Entries below are owner-provided and unverified. Reporting is not configured; no live source read or automatic suggestion is implied.</p></div>
         <form id="outcome-import-form" class="surface form profile-form">
-          <h2>Import owner-pasted workshops</h2>
+          <h2>Import owner-reviewed workshops</h2>
           <p>Paste a Markdown or tab-separated table with Date, Account and Workshop columns. Optional columns: Status, Notes and Source URL. Missing status remains “Not provided.” Future-delivered dates are checked only when your owner timezone is configured in Operations. Preview is local and read-only; source links are saved as inert references and never fetched.</p>
+          <label>Workshop screenshot <span>optional; PNG, JPEG or BMP, up to 4 MiB and 16 megapixels</span><input id="outcome-import-image" type="file" accept="image/png,image/jpeg,image/bmp"></label>
+          <div class="workflow-actions"><button id="outcome-import-ocr" type="button" class="button" disabled>Extract text on this device</button></div>
+          <p id="outcome-import-ocr-status" class="muted" aria-live="polite">On Windows, the selected image is processed by the installed local OCR engine. Before confirmation, the app creates no screenshot or OCR-text file and makes no cloud request. The operating system, browser, crash dumps, or other same-user software may retain data outside the app's control. OCR text is never imported automatically; inspect and correct it before previewing and explicitly confirming.</p>
+          <label>Text source <span>owner-stated and not independently verified</span><select name="sourceMethod"><option value="pasted">Pasted text</option><option value="screenshot-ocr">Screenshot OCR</option><option value="screenshot-ocr-edited">Screenshot OCR, edited</option></select></label>
           <label>Workshop table<textarea name="text" rows="7" maxlength="16000" required placeholder="Date | Account | Workshop | Status | Notes | Source URL&#10;2026-10-12 | Example Account | Example workshop | Delivered | Owner-provided note | https://example.invalid/workshop"></textarea></label>
           <div class="workflow-actions"><button id="outcome-import-preview" type="submit" class="button">Preview import</button><button id="outcome-import-reject" type="button" class="button" disabled>Discard preview</button></div>
           <div id="outcome-import-preview-result" aria-live="polite"></div>
@@ -232,17 +253,21 @@
           <label>Date <span>optional</span><input name="date" type="date"></label>
           <label>Your notes<textarea name="note" maxlength="4000" rows="3"></textarea></label>
           <button class="button primary" type="submit">Save local entry</button>
+          <p data-save-status class="muted" role="status"></p>
         </form>
         <div id="outcome-list" class="draft-list records-list"></div>
       </section>
 
       <section id="view-portfolio" class="view" hidden>
-        <div class="page-heading"><div><p class="eyebrow">OWNER-PROVIDED CONTEXT</p><h1>Accounts, <em>kept locally.</em></h1><p>Manual notes do not prove account ownership or source verification.</p></div></div>
+        <div class="page-heading"><div><p class="eyebrow">OWNER-PROVIDED CONTEXT</p><h1>Accounts, <em>kept locally.</em></h1><p>Only accounts and people you explicitly enter appear here. Details are local and unverified; accounts are never matched or merged by name.</p></div><button id="new-account" class="button primary" type="button">＋ New account</button></div>
         <form id="account-form" class="surface form">
           <label>Account label<input name="title" maxlength="160" required></label>
-          <label>Your local context<textarea name="note" rows="3" maxlength="4000"></textarea></label>
-          <button class="button primary" type="submit">Save local account note</button>
+          <label>Account context<textarea name="note" rows="3" maxlength="4000"></textarea></label>
+          <label>Your account plan <span>owner-entered, not a forecast or report</span><textarea name="plan" rows="4" maxlength="4000"></textarea></label>
+          <label>Stakeholders you explicitly name <span>names, roles, and relationship context; never directory-matched</span><textarea name="stakeholders" rows="4" maxlength="4000"></textarea></label>
+          <div class="workflow-actions"><button class="button primary" type="submit">Save local account</button><button id="account-cancel-edit" class="button" type="button" hidden>Cancel edit</button></div>
         </form>
+        <div class="toolbar records-toolbar"><label class="search"><span>⌕</span><input id="account-search" type="search" placeholder="Search your accounts and notes…" aria-label="Search local accounts"></label><span id="account-count" class="muted"></span></div>
         <div id="account-list" class="draft-list records-list"></div>
       </section>
 
@@ -257,8 +282,10 @@
     <form id="task-form" method="dialog" class="form">
       <div class="dialog-heading"><div><p class="eyebrow">LOCAL TASK</p><h2 id="task-dialog-title">Make a little progress.</h2></div><button id="close-task" class="icon-button" type="button" aria-label="Close">×</button></div>
       <p id="task-source-review" class="muted" role="status" hidden></p>
+      <p data-save-status class="muted" role="status"></p>
       <label>Title<input name="title" required maxlength="160" autocomplete="off"></label>
       <label>Details <span>optional</span><textarea name="details" maxlength="3000" rows="4"></textarea></label>
+      <label>Local account <span>optional, explicitly selected</span><select name="accountId"><option value="">Unassigned</option></select></label>
       <label>Status<select name="status"><option value="next">Next up</option><option value="doing">In progress</option><option value="waiting">Waiting</option><option value="done">Completed</option></select></label>
       <label>Priority<select name="priority"><option value="normal">Normal</option><option value="important">Important</option></select></label>
       <label>Due date <span>optional</span><input name="dueDate" type="date"></label>
@@ -270,13 +297,14 @@
       <div class="dialog-heading"><div><p class="eyebrow">TASK CONTEXT · LOCAL ONLY</p><h2 id="conversation-title">Task notes</h2></div><button id="close-conversation" class="icon-button" aria-label="Close task notes">×</button></div>
       <h3>Task timeline</h3><div id="task-timeline"></div>
       <div id="conversation-messages" class="conversation-messages"></div>
-      <form id="conversation-form" class="form"><label>Local note<textarea name="text" required maxlength="4000" rows="3"></textarea></label><button class="button primary" type="submit">Save note, not a command</button></form>
+      <form id="conversation-form" class="form"><label>Local note<textarea name="text" required maxlength="4000" rows="3"></textarea></label><button class="button primary" type="submit">Save note, not a command</button><p data-save-status class="muted" role="status"></p></form>
       <form id="evidence-form" class="form">
         <h3>Owner-provided evidence</h3>
         <label>Title or email subject<input name="title" required maxlength="160"></label>
         <label>Original HTTP(S) link<input name="url" required type="url" maxlength="2000"></label>
         <label>Context note<textarea name="note" maxlength="3000" rows="2"></textarea></label>
         <button class="button" type="submit">Attach unverified local evidence</button>
+        <p data-save-status class="muted" role="status"></p>
       </form>
       <div id="task-evidence" class="draft-list"></div>
       <button id="summarize-task" class="button">Queue local task outline</button>

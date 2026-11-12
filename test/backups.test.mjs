@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import { startServer } from '../src/server.mjs';
 import { createLocalBackup, recoverLocalBackup } from '../src/backups.mjs';
 import { openStore } from '../src/store.mjs';
+import { backupWindowDay } from '../src/worker.mjs';
 
 async function setup(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'esquie-backup-test-'));
@@ -26,6 +27,13 @@ async function setup(t, options = {}) {
     async restart() {
       await app.close();
       app = await startServer({ dataDir: root, port: 0, workerIntervalMs: 0, verifyLocalVolume: async () => true, clock: () => now, ...options });
+    },
+    async seedScheduler(scheduler) {
+      await app.close();
+      const store = await openStore(root);
+      try { store.update(state => Object.assign(state.scheduler, scheduler)); }
+      finally { await store.close(); }
+      app = await startServer({ dataDir: root, port: 0, workerIntervalMs: 0, verifyLocalVolume: async () => true, clock: () => now });
     },
     async queue(kind) {
       const response = await request('/api/jobs', { kind, requestId: randomUUID() });
@@ -528,6 +536,97 @@ test('daily backup attempts respect quiet hours, pause, restart and failures wit
   assert.equal(state.jobs[0].status, 'failed');
   assert.equal(state.backups.length, 1);
   assert.equal((await readdir(join(context.root, 'backups'))).length, 1);
+});
+
+test('backup windows follow local 07:00 through DST changes and calendar boundaries', () => {
+  for (const [timezone, instant, expected] of [
+    ['America/New_York', '2026-03-08T10:59:59Z', '2026-03-07'],
+    ['America/New_York', '2026-03-08T11:00:00Z', '2026-03-08'],
+    ['America/New_York', '2026-11-01T11:59:59Z', '2026-10-31'],
+    ['America/New_York', '2026-11-01T12:00:00Z', '2026-11-01'],
+    ['Asia/Kathmandu', '2027-01-01T01:14:59Z', '2026-12-31'],
+    ['Asia/Kathmandu', '2027-01-01T01:15:00Z', '2027-01-01'],
+    ['UTC', '2024-03-01T06:59:59Z', '2024-02-29']
+  ]) assert.equal(backupWindowDay(timezone, new Date(instant)), expected, `${timezone} ${instant}`);
+});
+
+test('initial early backup, manual attempt and missed morning windows survive restarts without retries', async t => {
+  const context = await setup(t);
+  context.clock('2026-03-04T06:30:00Z');
+  await context.request('/api/profile', { timezone: 'UTC' }, 'PATCH');
+  await context.request('/api/preferences', { dailyBackups: true }, 'PATCH');
+  await context.app.worker.tick();
+  let state = await context.state();
+  assert.equal(state.jobs.length, 1);
+  assert.equal(state.jobs[0].status, 'failed');
+  assert.equal(state.scheduler.lastBackupDay, '2026-03-03');
+  await context.restart();
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.length, 1);
+  context.clock('2026-03-04T07:00:00Z');
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.length, 2);
+  context.clock('2026-03-06T06:30:00Z');
+  await context.queue('backup');
+  await context.app.worker.tick();
+  state = await context.state();
+  assert.equal(state.jobs.length, 3);
+  assert.equal(state.scheduler.lastBackupDay, '2026-03-05');
+  await context.restart();
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.length, 3);
+  context.clock('2026-03-06T07:00:00Z');
+  await context.app.worker.tick();
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.length, 4);
+});
+
+test('legacy timestamps determine pre-07:00 windows; day-only state conservatively prevents duplicates', async t => {
+  const context = await setup(t);
+  await context.request('/api/profile', { timezone: 'America/New_York' }, 'PATCH');
+  await context.request('/api/preferences', { dailyBackups: true }, 'PATCH');
+  context.clock('2026-03-08T10:30:00Z');
+  await context.seedScheduler({ lastBackupDay: '2026-03-08', lastBackupAttemptAt: '2026-03-08T10:15:00.000Z' });
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.length, 0);
+  context.clock('2026-03-08T11:00:00Z');
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.length, 1);
+  await context.seedScheduler({ lastBackupDay: '2026-03-09', lastBackupAttemptAt: null });
+  context.clock('2026-03-09T10:30:00Z');
+  await context.app.worker.tick();
+  context.clock('2026-03-09T11:00:00Z');
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.length, 1);
+  context.clock('2026-03-10T11:00:00Z');
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.length, 2);
+});
+
+test('clock rollback does not replay a spent window, including after a manual backup and restart', async t => {
+  const context = await setup(t);
+  await context.request('/api/profile', { timezone: 'UTC' }, 'PATCH');
+  await context.request('/api/preferences', { dailyBackups: true }, 'PATCH');
+  context.clock('2026-03-06T09:00:00Z');
+  await context.app.worker.tick();
+  context.clock('2026-03-05T08:00:00Z');
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.length, 1);
+  await context.queue('backup');
+  await context.app.worker.tick();
+  let state = await context.state();
+  assert.equal(state.jobs.length, 2);
+  assert.equal(state.jobs[0].origin, 'owner');
+  assert.equal(state.scheduler.lastBackupAttemptAt, '2026-03-06T09:00:00.000Z');
+  await context.restart();
+  context.clock('2026-03-06T10:00:00Z');
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.length, 2);
+  context.clock('2026-03-07T07:00:00Z');
+  await context.app.worker.tick();
+  state = await context.state();
+  assert.equal(state.jobs.length, 3);
+  assert.equal(state.scheduler.lastBackupDay, '2026-03-07');
 });
 
 test('corrupt backups and pre-existing destinations fail closed without overwriting or deleting anything', async t => {
