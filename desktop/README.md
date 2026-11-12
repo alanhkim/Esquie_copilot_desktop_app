@@ -37,6 +37,12 @@ untouched. The later portable-lockfile restore without lifecycle scripts is
 separate and does not establish a fresh complete desktop installation.
 See the [validation record](../docs/parity-report.md) for precise limits.
 
+A separate fresh `npm ci --no-audit --no-fund` under existing policy exited 0, but
+npm blocked the `electron-winstaller@5.4.0` install script under its existing
+`allowScripts` policy. A complete desktop installation, runtime and installer
+remain unverified. No script approval or policy bypass was attempted for this
+fresh restore; exit 0 does not establish a fully installed desktop.
+
 `dist` builds a local unsigned per-user NSIS installer; it does not publish.
 Install the generated `dist\Esquie-Local-Setup-0.1.0-x64.exe` interactively.
 Windows or organizational policy may warn about or block unsigned installers;
@@ -52,6 +58,24 @@ installation. Program updates and normal uninstall do not delete it. Back it up
 before upgrading, particularly when changing backend versions; no data migration
 or downgrade is promised by this wrapper. The first launch initializes a new
 workspace. The wrapper does not import any other installation or its data.
+This desktop default differs from the standalone dashboard default. To use the
+same **verified recreation** workspace, quit its current host and set
+`ESQUIE_DATA_DIR` to that private local directory before starting either host:
+
+```powershell
+$env:ESQUIE_DATA_DIR = 'C:\path\to\verified-recreation-workspace'
+npm start
+```
+
+Set the variable in the environment that launches the desktop app; a shortcut or
+sign-in startup may not inherit a terminal-only setting. With no override, the
+desktop default remains unchanged. The server applies the same ownership, lock,
+private-storage and recovery checks as standalone; an unsafe or already-open
+workspace is refused. No workspace is moved, copied, merged or overwritten by
+this selection. For a separately prepared paused recovery or explicit legacy
+adoption, quit the owning host and set the override to the resulting verified
+directory; follow the repository's [recovery guidance](../README.md#storage-output-and-upgrades)
+before resuming or reconnecting. Never select the original installation.
 Windows sign-in startup is **off by default** and can be enabled explicitly in
 the application or tray menu for an installed build. It is unavailable in dev mode.
 The synthetic smoke uses a fake server to verify protected launch and reload;
@@ -60,6 +84,10 @@ the ordinary smoke exercises the integrated backend in a temporary workspace.
 only those copied runtime files with disposable data and port zero, using Node
 without Electron/build artifacts. Missing imported runtime modules fail this
 check; it does not replace a real policy-compliant package/install validation.
+The allowlist includes the task-board browser ES module and the backend's
+`connectors/safe-file-download.mjs` import. Packaging these files does not enable
+selected content in the app: no content UI/sign-in is supplied, and the default
+Windows downloader deliberately remains unavailable.
 
 ## Integration and limitations
 

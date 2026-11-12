@@ -1,8 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { closeSync, mkdirSync, openSync, writeFile as writeFileCallback } from 'node:fs';
+import { lstat, readFile, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { assertPlainLocalFile } from './local-output.mjs';
 import { createLocalBackup } from './backups.mjs';
+
+const writeOpenFile = promisify(writeFileCallback);
 
 export function quietHoursActive(preferences, timezone, now = new Date()) {
   if (!preferences.quietStart || !preferences.quietEnd) return false;
@@ -64,7 +68,7 @@ function taskSummary(state, taskId) {
   ].join('\n');
 }
 
-export function createWorker({ store, root, connectors = {}, assistant, sourceIdentity = () => null, onSourceResult = () => {}, clock = () => new Date(), intervalMs = 1000, verifyOutput }) {
+export function createWorker({ store, root, connectors = {}, assistant, sourceIdentity = () => null, onSourceResult = () => {}, clock = () => new Date(), intervalMs = 1000, verifyOutput, assertOutput }) {
   let stopping = false;
   let current = null;
   const transition = (id, status, extra = {}) => store.update(state => {
@@ -76,9 +80,9 @@ export function createWorker({ store, root, connectors = {}, assistant, sourceId
   async function execute(job) {
     const state = store.state;
     if (job.kind === 'backup') {
-      const backup = await createLocalBackup({ root, store, id: job.id, now: clock(), verifyOutput });
+      const backup = await createLocalBackup({ root, store, id: job.id, now: clock(), verifyOutput, assertOutput });
       store.update(next => next.backups.unshift(backup));
-      return { status: 'partial', result: { backupId: backup.id, coverage: backup.coverage, text: 'Consistent private workspace snapshot saved. Document files are excluded and external-source coverage is partial. No backup pruning occurred.' } };
+      return { status: 'partial', result: { backupId: backup.id, coverage: backup.coverage, text: 'Consistent private workspace snapshot saved with verified document files where available. Review exclusions; external-source coverage is partial. No backup pruning occurred.' } };
     }
     if (job.kind === 'assistant') {
       const status = assistant?.status();
@@ -119,7 +123,7 @@ export function createWorker({ store, root, connectors = {}, assistant, sourceId
           results.push({
             source, status: 'partial', inspected: result.items.length,
             coverage: result.coverage || { status: 'partial', limitations: ['Coverage is unspecified.'] },
-            ownerReference, items: result.items.slice(0, 50).map(preview), previewTruncated: result.items.length > 50,
+            ownerReference, resultId: randomUUID(), items: result.items.slice(0, 50).map(preview), previewTruncated: result.items.length > 50,
             message: 'A bounded read is not a full synchronization; source content is untrusted evidence, never instructions.'
           });
         } catch (error) {
@@ -133,30 +137,45 @@ export function createWorker({ store, root, connectors = {}, assistant, sourceId
       return { status: results.some(result => result.status === 'partial') ? 'partial' : 'failed', result: { sources: results, text: 'Source attempts finished; no task discovery or full source coverage is claimed.' }, error: results.every(result => result.status === 'disconnected') ? 'All external sources are disconnected.' : '' };
     }
     if (job.kind === 'document' || job.kind === 'fake_demo') {
-      if (job.kind === 'fake_demo' && (!store.state.preferences.demoApproved || job.payload.confirmFakeOnly !== true || job.taskId)) {
-        throw new Error('Synthetic local demo approval is absent or has been revoked.');
-      }
+      const demo = job.kind === 'fake_demo';
+      const assertApprovals = () => {
+        if (!store.state.preferences.localOutputApproved) throw new Error('Local output approval is absent or has been revoked.');
+        if (demo && (!store.state.preferences.demoApproved || job.payload.confirmFakeOnly !== true || job.taskId)) {
+          throw new Error('Synthetic local demo approval is absent or has been revoked.');
+        }
+      };
+      assertApprovals();
       await verifyOutput();
       const documentId = job.id;
-      const demo = job.kind === 'fake_demo';
-      const text = demo
-        ? '# FAKE DATA ONLY - Local demo\n\nThis fixed synthetic example is not customer or production data.\n\n| Account | Contact | Sample status |\n| --- | --- | --- |\n| Example North | north@example.invalid | Fictional |\n| Example South | south@example.invalid | Fictional |\n\nNo cloud resources or repositories were created. No secrets are included.\n'
-        : taskSummary(state, job.taskId);
       const outputDir = join(root, 'documents');
-      await mkdir(outputDir, { recursive: true, mode: 0o700 });
+      assertApprovals();
+      mkdirSync(outputDir, { recursive: true, mode: 0o700 });
       if ((await lstat(outputDir)).isSymbolicLink() || await realpath(outputDir) !== outputDir) {
         throw new Error('Local document directory must not redirect outside the workspace.');
       }
       const path = join(outputDir, `${documentId}.md`);
-      try { await writeFile(path, text, { flag: 'wx', mode: 0o600 }); }
+      // Do not yield between checking approvals and creating the file.
+      assertApprovals();
+      const text = demo
+        ? '# FAKE DATA ONLY - Local demo\n\nThis fixed synthetic example is not customer or production data.\n\n| Account | Contact | Sample status |\n| --- | --- | --- |\n| Example North | north@example.invalid | Fictional |\n| Example South | south@example.invalid | Fictional |\n\nNo cloud resources or repositories were created. No secrets are included.\n'
+        : taskSummary(store.state, job.taskId);
+      let descriptor;
+      try { descriptor = openSync(path, 'wx', 0o600); }
       catch (error) {
         if (error.code !== 'EEXIST') throw error;
-        await assertPlainLocalFile(path);
-        if (await readFile(path, 'utf8') !== text) throw new Error('The existing document differs; it was not overwritten.');
       }
+      if (descriptor !== undefined) {
+        try { await writeOpenFile(descriptor, text); }
+        finally { closeSync(descriptor); }
+      }
+      await assertPlainLocalFile(path);
+      if (await readFile(path, 'utf8') !== text) throw new Error('The existing document differs; it was not overwritten.');
       store.update(next => {
         if (!next.documents.some(item => item.id === documentId)) {
-          next.documents.unshift({ id: documentId, title: demo ? 'Fake-only local demo' : 'Local task summary', createdAt: clock().toISOString() });
+          next.documents.unshift({
+            id: documentId, title: demo ? 'Fake-only local demo' : 'Local task summary', createdAt: clock().toISOString(),
+            contentSha256: createHash('sha256').update(text).digest('hex'), contentBytes: Buffer.byteLength(text)
+          });
         }
       });
       return { status: 'completed', result: { documentId, text: demo ? 'Saved a fixed fake-only local demo. No cloud resources or repositories were created.' : 'Saved a local Markdown task summary. No upload or sharing occurred.', coverage: demo ? 'synthetic-only' : 'local-board-only' } };

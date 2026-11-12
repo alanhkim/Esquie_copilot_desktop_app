@@ -88,6 +88,12 @@ input[type="checkbox"] { accent-color: var(--green); }
 .task-details { margin: 6px 0 0; color: #77766e; font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .task-meta { margin-top: 9px; color: #97938b; font-size: 9px; }
 .task-actions { display: flex; gap: 7px; }
+.task-moves { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.task-moves select, .task-moves button { min-height: 36px; max-width: 100%; padding: 6px 9px; border: 1px solid var(--line); border-radius: 6px; background: white; font: inherit; }
+.task-moves button { cursor: pointer; }
+.task-moves button:disabled { cursor: default; opacity: .5; }
+.task-drag { padding: 8px; color: var(--muted); font-size: 10px; cursor: grab; }
+.task-moves :focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
 .task-actions button { padding: 5px 8px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #77766e; cursor: pointer; font-size: 10px; }
 .task-actions button:hover { border-color: var(--line); background: #faf8f4; }
 .empty-lane, .empty-panel { padding: 28px; border: 1px dashed #ded9cf; border-radius: 12px; background: #fbf9f5; color: var(--muted); text-align: center; }
@@ -102,6 +108,12 @@ input[type="checkbox"] { accent-color: var(--green); }
 .empty-panel textarea { width: 100%; max-width: 640px; display: block; margin: 20px 0 10px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; resize: vertical; background: #f8f6f1; }
 .spark { color: var(--green); font-size: 23px; }
 .draft-layout { display: grid; grid-template-columns: minmax(280px, .9fr) minmax(320px, 1.1fr); gap: 17px; }
+#outlook-draft-form { grid-column: 1 / -1; }
+.outlook-compose-layout { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 17px; }
+.outlook-compose-layout > * { min-width: 0; }
+@media (max-width: 760px) {
+  .outlook-compose-layout { grid-template-columns: minmax(0, 1fr); }
+}
 .surface { padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .form { display: grid; gap: 14px; }
 .form h2, .section-title h2 { margin: 0; font: 20px Georgia, serif; }

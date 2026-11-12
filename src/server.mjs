@@ -19,7 +19,8 @@ const PUBLIC_FILES = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/index.html', ['index.html', 'text/html; charset=utf-8']],
   ['/styles.css', ['styles.css', 'text/css; charset=utf-8']],
-  ['/app.js', ['app.js', 'text/javascript; charset=utf-8']]
+  ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/task-board.mjs', ['task-board.mjs', 'text/javascript; charset=utf-8']]
 ]);
 const TASK_STATUSES = new Set(['next', 'doing', 'waiting', 'done']);
 const MAX_BODY_BYTES = 20_000;
@@ -316,13 +317,21 @@ export async function startServer({
   const sourceConnectors = { ...microsoft365.connectors, ...connectors };
   const sourceIdentity = () => microsoft365.status().identity;
   const sourceHealth = new Map();
+  let outputApprovalSequence = 0n;
+  let latestOutputApproval = 0n;
+  let demoApprovalSequence = 0n;
+  let latestDemoApproval = 0n;
+  const assertOutput = () => {
+    if (!store.state.preferences.localOutputApproved) throw new Error('Local output approval is absent or has been revoked.');
+  };
   const verifyOutput = async () => {
     assertPrivateDataDirectory(root);
     await assertPrivateStorage(root);
-    return assertOutputAllowed({ root, approved: store.state.preferences.localOutputApproved, redirected: outputRedirected, verifyVolume: verifyLocalVolume });
+    await assertOutputAllowed({ root, approved: store.state.preferences.localOutputApproved, redirected: outputRedirected, verifyVolume: verifyLocalVolume });
+    assertOutput();
   };
   worker = createWorker({
-    store, root, connectors: sourceConnectors, assistant, sourceIdentity, clock, intervalMs: workerIntervalMs, verifyOutput,
+    store, root, connectors: sourceConnectors, assistant, sourceIdentity, clock, intervalMs: workerIntervalMs, verifyOutput, assertOutput,
     onSourceResult: result => sourceHealth.set(result.source, result)
   });
 
@@ -474,15 +483,35 @@ export async function startServer({
 
       if (request.method === 'POST' && pathname === '/api/mail/reply-drafts') {
         const body = await readJson(request);
-        assertOnlyKeys(body, new Set(['messageId', 'text', 'replyAll', 'requestId']), 'Only an exact message ID, reply text, replyAll flag, and UUID request ID are accepted.');
+        assertOnlyKeys(body, new Set(['messageId', 'text', 'replyAll', 'requestId', 'sourceReference']), 'Only an exact message ID, reply text, replyAll flag, UUID request ID, and optional source-result reference are accepted.');
         const messageId = safeText(body.messageId, 'Message ID', 2000, { required: true });
         const text = safeText(body.text, 'Reply text', 12000, { required: true });
         if (typeof body.replyAll !== 'boolean') throw new HttpError(400, 'Choose reply or reply-all explicitly.');
         if (typeof body.requestId !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(body.requestId)) throw new HttpError(400, 'A UUID request ID is required.');
         const connector = microsoft365.connectors.mail;
-        if (microsoft365.status().state !== 'connected') throw new HttpError(503, 'Outlook is disconnected. No draft was created.');
-        const ownerReference = JSON.stringify(sourceIdentity());
-        const fingerprint = createHash('sha256').update(JSON.stringify({ messageId, text, replyAll: body.replyAll })).digest('hex');
+        const connection = microsoft365.status();
+        if (connection.state !== 'connected' || !connection.verifiedOwner || !connection.identity) throw new HttpError(503, 'Outlook is disconnected. No draft was created.');
+        const ownerReference = JSON.stringify(connection.identity);
+        let sourceReference;
+        if (Object.hasOwn(body, 'sourceReference')) {
+          const reference = body.sourceReference;
+          if (!reference || typeof reference !== 'object' || Array.isArray(reference)) throw new HttpError(400, 'A bounded source-result reference is required for a preview-driven reply.');
+          assertOnlyKeys(reference, new Set(['jobId', 'resultId', 'itemId']), 'Only jobId, resultId and itemId are accepted in a source-result reference.');
+          const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+          if (typeof reference.jobId !== 'string' || !uuid.test(reference.jobId) ||
+              typeof reference.resultId !== 'string' || !uuid.test(reference.resultId) ||
+              typeof reference.itemId !== 'string' || !/^[0-9a-f]{64}$/.test(reference.itemId)) {
+            throw new HttpError(400, 'The source-result reference must contain UUID job/result IDs and an exact source item key.');
+          }
+          const job = store.state.jobs.find(item => item.id === reference.jobId && item.kind === 'source_refresh');
+          const source = job?.result?.sources?.find(item => item.source === 'mail' && item.resultId === reference.resultId);
+          const item = source?.items?.find(evidence => evidence.sourceKey === reference.itemId && evidence.id === messageId);
+          if (!item || source.ownerReference !== ownerReference) {
+            throw new HttpError(403, 'The selected mail evidence is missing, changed, or belongs to another owner. Explicitly check and select the source again; no draft was attempted.');
+          }
+          sourceReference = { jobId: reference.jobId, resultId: reference.resultId, itemId: reference.itemId };
+        }
+        const fingerprint = createHash('sha256').update(JSON.stringify({ messageId, text, replyAll: body.replyAll, ...(sourceReference ? { sourceReference } : {}) })).digest('hex');
         const previous = store.state.draftOperations.find(item => item.requestId === body.requestId);
         if (previous) {
           if (previous.fingerprint !== fingerprint || previous.ownerReference !== ownerReference) throw new HttpError(409, 'This request ID belongs to different work.');
@@ -495,7 +524,7 @@ export async function startServer({
         if (store.state.draftOperations.some(item => item.ownerReference === ownerReference && item.messageId === messageId && ['creating', 'unknown', 'completed'].includes(item.status))) {
           throw new HttpError(409, 'A draft for this source already exists or may exist. Inspect Outlook; no second draft was created.');
         }
-        updateState(next => next.draftOperations.push({ requestId: body.requestId, messageId, ownerReference, fingerprint, status: 'creating', createdAt: clock().toISOString() }));
+        updateState(next => next.draftOperations.push({ requestId: body.requestId, messageId, ownerReference, fingerprint, ...(sourceReference ? { sourceReference } : {}), status: 'creating', createdAt: clock().toISOString() }));
         try {
           const draft = await connector.createReplyDraft({ messageId, text, replyAll: body.replyAll, signal: AbortSignal.timeout(30_000) });
           if (draft.isDraft !== true || draft.verifiedOwner !== true) throw new Error('Draft verification is missing.');
@@ -547,7 +576,7 @@ export async function startServer({
         if (!backup) throw new HttpError(404, 'Saved backup not found.');
         if (backup.fileUnavailableReason) throw new HttpError(410, backup.fileUnavailableReason);
         let recovery;
-        try { recovery = await recoverLocalBackup({ root, backup, now: clock(), verifyOutput }); }
+        try { recovery = await recoverLocalBackup({ root, backup, now: clock(), verifyOutput, assertOutput }); }
         catch { throw new HttpError(409, 'Private recovery was blocked or failed integrity/storage checks. Original workspace, backups and any pre-existing files were not overwritten. Check output approval and private storage.'); }
         updateState(next => next.recoveries.unshift(recovery));
         jsonResponse(response, 201, { recovery });
@@ -601,25 +630,32 @@ export async function startServer({
       }
 
       if (request.method === 'POST' && pathname === '/api/output-approval') {
+        const sequence = ++outputApprovalSequence;
         const body = await readJson(request);
         assertOnlyKeys(body, new Set(['confirmPrivateNonSynced']), 'Only explicit local output confirmation is supported.');
         if (typeof body.confirmPrivateNonSynced !== 'boolean') throw new HttpError(400, 'Confirm the local destination explicitly.');
+        if (sequence < latestOutputApproval) throw new HttpError(409, 'A newer output approval decision superseded this request.');
         if (body.confirmPrivateNonSynced) {
           assertPrivateDataDirectory(root);
           await assertPrivateStorage(root);
           try { await assertOutputAllowed({ root, approved: true, redirected: outputRedirected, verifyVolume: verifyLocalVolume }); }
           catch (error) { throw new HttpError(403, error.message); }
         }
+        if (sequence < latestOutputApproval) throw new HttpError(409, 'A newer output approval decision superseded this request.');
         updateState(next => { next.preferences.localOutputApproved = body.confirmPrivateNonSynced; });
+        latestOutputApproval = sequence;
         jsonResponse(response, 200, { approved: body.confirmPrivateNonSynced });
         return;
       }
 
       if (request.method === 'POST' && pathname === '/api/demo-approval') {
+        const sequence = ++demoApprovalSequence;
         const body = await readJson(request);
         assertOnlyKeys(body, new Set(['confirmSyntheticLocalOnly']), 'Only approval of fixed local synthetic demos is supported.');
         if (typeof body.confirmSyntheticLocalOnly !== 'boolean') throw new HttpError(400, 'Approve or revoke the local demo configuration explicitly.');
+        if (sequence < latestDemoApproval) throw new HttpError(409, 'A newer demo approval decision superseded this request.');
         updateState(next => { next.preferences.demoApproved = body.confirmSyntheticLocalOnly; });
+        latestDemoApproval = sequence;
         jsonResponse(response, 200, { approved: body.confirmSyntheticLocalOnly, mode: 'fixed-synthetic-local-document-only' });
         return;
       }
@@ -668,7 +704,7 @@ export async function startServer({
         if (typeof body.requestId !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(body.requestId)) throw new HttpError(400, 'A UUID request ID is required.');
         if (body.taskId != null) taskById(state, body.taskId);
         if (body.kind !== 'meeting_notes' && Object.hasOwn(body, 'notes')) throw new HttpError(400, 'Only meeting-note jobs accept notes.');
-        if (body.kind === 'fake_demo' && (!state.preferences.demoApproved || body.confirmFakeOnly !== true || body.taskId)) {
+        if (body.kind === 'fake_demo' && (!store.state.preferences.demoApproved || body.confirmFakeOnly !== true || body.taskId)) {
           throw new HttpError(403, 'Demo creation needs approved local synthetic-only configuration and explicit confirmation for this run; task/customer inputs are not accepted.');
         }
         if (body.kind !== 'fake_demo' && Object.hasOwn(body, 'confirmFakeOnly')) throw new HttpError(400, 'Fake-only confirmation applies only to demo jobs.');
@@ -775,17 +811,27 @@ export async function startServer({
 
       if (request.method === 'POST' && pathname === '/api/tasks/from-evidence') {
         const body = await readJson(request);
-        assertOnlyKeys(body, new Set(['jobId', 'source', 'itemId', 'title', 'details', 'status', 'priority', 'dueDate']), 'Only a source-result reference and explicit local task fields are accepted.');
+        assertOnlyKeys(body, new Set(['jobId', 'source', 'resultId', 'itemId', 'title', 'details', 'status', 'priority', 'dueDate']), 'Only an exact source-result reference and explicit local task fields are accepted.');
         const title = safeText(body.title, 'Title', 160, { required: true });
         const details = safeText(body.details ?? '', 'Details', 3000);
-        const source = state.jobs.find(job => job.id === body.jobId)?.result?.sources?.find(item => item.source === body.source);
+        const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+        if (typeof body.jobId !== 'string' || !uuid.test(body.jobId) ||
+            typeof body.resultId !== 'string' || !uuid.test(body.resultId) ||
+            typeof body.source !== 'string' || body.source.length > 80 ||
+            typeof body.itemId !== 'string' || !/^[0-9a-f]{64}$/.test(body.itemId)) {
+          throw new HttpError(403, 'An exact source-result revision is required. Run a new bounded source check and explicitly select its preview; no task was created.');
+        }
+        const currentState = store.state;
+        const job = currentState.jobs.find(job => job.id === body.jobId && job.kind === 'source_refresh');
+        const source = job?.result?.sources?.find(item => item.source === body.source && item.resultId === body.resultId);
         const item = source?.items?.find(evidence => evidence.sourceKey === body.itemId && evidence.id);
-        const identity = microsoft365.status().identity;
-        if (!item || !identity || source.ownerReference !== JSON.stringify(identity) || microsoft365.status().state !== 'connected') {
-          throw new HttpError(403, 'The evidence does not belong to the currently verified owner. Reconnect and explicitly check the source.');
+        const connection = microsoft365.status();
+        const identity = connection.identity;
+        if (!item || !identity || !connection.verifiedOwner || source.ownerReference !== JSON.stringify(identity) || connection.state !== 'connected') {
+          throw new HttpError(403, 'The selected evidence is missing, changed, or does not belong to the currently verified owner. Reconnect if needed, run a new bounded source check and explicitly select its preview; no task was created.');
         }
         const sourceKey = createHash('sha256').update(JSON.stringify([identity, body.source, item.sourceKey])).digest('hex');
-        const existing = store.state.tasks.find(task => task.sourceKey === sourceKey);
+        const existing = currentState.tasks.find(task => task.sourceKey === sourceKey);
         if (existing) {
           jsonResponse(response, 200, { task: existing, deduplicated: true, message: 'The existing task was retained; completed work was not reopened.' });
           return;
@@ -798,7 +844,8 @@ export async function startServer({
           priority, dueDate: body.dueDate ? safeDate(body.dueDate) : '', sourceKey,
           evidence: [{
             id: randomUUID(), title: item.title, url: item.url, note: item.excerpt,
-            provenance: 'authorized-source-untrusted-evidence', source: body.source, createdAt: now
+            provenance: 'authorized-source-untrusted-evidence', source: body.source, createdAt: now,
+            sourceReference: { jobId: job.id, resultId: source.resultId, itemId: item.sourceKey }
           }]
         }, now));
         jsonResponse(response, 201, { task, message: 'You created this task explicitly. Source content is evidence, not proof of an outstanding assignment.' });

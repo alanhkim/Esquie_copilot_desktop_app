@@ -27,7 +27,7 @@ export async function assertOutputAllowed({ root, approved, redirected = false, 
 
 export async function assertPlainLocalFile(path) {
   const file = await lstat(path);
-  if (!file.isFile() || file.isSymbolicLink() || resolve(path) !== await realpath(path)) {
-    throw new Error('Local document files must not be redirected through symlinks or junctions.');
+  if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1 || resolve(path) !== await realpath(path)) {
+    throw new Error('Local document files must be single-link files without symlink or junction redirection.');
   }
 }

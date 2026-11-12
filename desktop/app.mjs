@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, Menu, nativeImage, session, shell, Tray } from 'electron';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isDashboardUrl, isExternalWebUrl, startOwnedServer, workspaceServerPath } from './host.mjs';
+import { isDashboardUrl, isExternalWebUrl, startOwnedServer, workspaceDataDir, workspaceServerPath } from './host.mjs';
 
 const desktopDir = dirname(fileURLToPath(import.meta.url));
 
@@ -66,7 +66,7 @@ export function createDesktop({ dataDir, serverPath } = {}) {
     });
     backend = await startOwnedServer({
       serverPath: location,
-      dataDir: dataDir || join(process.env.LOCALAPPDATA || app.getPath('userData'), 'EsquieLocal', 'Workspace')
+      dataDir: workspaceDataDir({ dataDir, userDataDir: app.getPath('userData') })
     });
     if (quitting) return;
     session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));

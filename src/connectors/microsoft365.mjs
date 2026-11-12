@@ -1,6 +1,15 @@
+import {
+  createSafeFileDownloader, directFileEgressAllowed, MAX_FILE_CONTENT_BYTES,
+  normalizeApprovedHost, SafeFileDownloadError, validateApprovedHttpsUrl
+} from './safe-file-download.mjs';
+
 const GRAPH = 'https://graph.microsoft.com/v1.0';
 const DAY = 86_400_000;
 const MAX_BYTES = 1_048_576;
+const FILE_DOWNLOAD_ERROR_CODES = new Set([
+  'blocked_request', 'cancelled', 'file_content_unavailable', 'invalid_content_encoding',
+  'invalid_response', 'network_policy_unavailable', 'response_too_large', 'timeout', 'transport_error'
+]);
 const MESSAGE_FIELDS = 'id,subject,webLink,conversationId,isDraft,receivedDateTime,from,toRecipients,ccRecipients,replyTo,body';
 const READ_PATHS = [
   /^\/me$/,
@@ -10,7 +19,8 @@ const READ_PATHS = [
   /^\/chats\/[^/]+\/messages$/,
   /^\/teams\/[^/]+\/channels\/[^/]+\/messages$/,
   /^\/me\/onlineMeetings\/[^/]+\/transcripts\/[^/]+\/content$/,
-  /^\/drives\/[^/]+\/items\/[^/]+$/
+  /^\/drives\/[^/]+\/items\/[^/]+$/,
+  /^\/drives\/[^/]+\/items\/[^/]+\/content$/
 ];
 
 export class ConnectorError extends Error {
@@ -40,6 +50,11 @@ function list(value, map) {
 
 function text(value) {
   return typeof value === 'string' ? value : '';
+}
+
+function validRevisionTag(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 1024 &&
+    value === value.trim() && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
 function link(value) {
@@ -111,12 +126,21 @@ function timestamp(value) {
 /**
  * Host-only adapter. Never expose tokenProvider, transport, or connect options to
  * source content or an unrestricted HTTP/agent tool.
- * @param {{tokenProvider?: Function, transport?: typeof fetch, timeoutMs?: number}} options
+ * @param {{tokenProvider?: Function, transport?: typeof fetch, timeoutMs?: number,
+ *   allowDirectFileEgress?: boolean, fileContentDownloader?: Function}} options
  */
 export function createMicrosoft365Connectors({
-  tokenProvider, transport = globalThis.fetch, timeoutMs = 15_000
+  tokenProvider, transport = globalThis.fetch, timeoutMs = 15_000,
+  allowDirectFileEgress = false, fileContentDownloader
 } = {}) {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > 60_000) fail('invalid_timeout');
+  if (typeof allowDirectFileEgress !== 'boolean') fail('invalid_source_configuration');
+  if (fileContentDownloader !== undefined && typeof fileContentDownloader !== 'function') {
+    fail('invalid_content_downloader');
+  }
+  const customFileContentDownloader = typeof fileContentDownloader === 'function';
+  const downloadFileContent = fileContentDownloader ??
+    createSafeFileDownloader({ allowDirectEgress: allowDirectFileEgress });
   let connection;
   let generation = 0;
   let state = 'disconnected';
@@ -186,7 +210,7 @@ export function createMicrosoft365Connectors({
         }
 
         // Routes are generated only by the closed operations below, never by a caller URL.
-        async function request(path, { method = 'GET', body, accept = 'application/json' } = {}) {
+        async function request(path, { method = 'GET', body, accept = 'application/json', manualRedirect = false } = {}) {
           check();
           const url = new URL(`${GRAPH}${path}`);
           if (url.origin !== 'https://graph.microsoft.com' || !url.pathname.startsWith('/v1.0/')) {
@@ -195,13 +219,17 @@ export function createMicrosoft365Connectors({
           if (method === 'GET' && !READ_PATHS.some(pattern => pattern.test(url.pathname.slice(5)))) {
             fail('blocked_request');
           }
+          if (manualRedirect && (method !== 'GET' ||
+              !/^\/drives\/[^/]+\/items\/[^/]+\/content$/.test(url.pathname.slice(5)))) {
+            fail('blocked_request');
+          }
           if (method !== 'GET' && !(method === 'POST' &&
               /^\/me\/messages\/[^/?]+\/createReply(?:All)?$/.test(path))) fail('blocked_request');
           if (method === 'POST') writeAttempted = true;
           let response;
           try {
             response = await transport(url.href, {
-              method, redirect: 'error', signal: controller.signal,
+              method, redirect: manualRedirect ? 'manual' : 'error', signal: controller.signal,
               headers: {
                 Authorization: `Bearer ${auth.accessToken}`, Accept: accept,
                 Prefer: 'IdType="ImmutableId", outlook.body-content-type="text"',
@@ -218,6 +246,13 @@ export function createMicrosoft365Connectors({
           if (response.status === 403) fail('permission_denied');
           if (response.status === 404) fail('source_unavailable');
           if (response.status === 429) fail('throttled');
+          if (manualRedirect) {
+            if (response.status !== 302) fail(response.ok ? 'invalid_response' : 'service_error');
+            const location = response.headers?.get?.('location');
+            await response.body?.cancel().catch(() => {});
+            if (typeof location !== 'string' || !location) fail('blocked_request');
+            return location;
+          }
           if (!response.ok || response.status < 200 || response.status >= 300) fail('service_error');
           if (!response.body?.getReader) fail('invalid_response');
           const reader = response.body.getReader();
@@ -250,7 +285,7 @@ export function createMicrosoft365Connectors({
         const owner = await request('/me?$select=id');
         if (owner?.id !== config.identity.userId) fail('identity_mismatch');
         check();
-        return action(request, check);
+        return action(request, check, controller.signal);
       })()]);
     } catch (error) {
       const code = error instanceof ConnectorError ? error.code : 'invalid_response';
@@ -323,7 +358,7 @@ export function createMicrosoft365Connectors({
 
   function page(value) {
     if (!value || !Array.isArray(value.value) || value.value.length > 50) fail('invalid_response');
-    // Never follow a server-supplied URL, including nextLink or download URLs.
+    // Never follow continuation or download URLs embedded in JSON evidence.
     return { values: value.value, hasMore: Boolean(value['@odata.nextLink']) };
   }
 
@@ -368,6 +403,92 @@ export function createMicrosoft365Connectors({
           joinUrl: link(value.onlineMeeting?.joinUrl), trust: 'untrusted-evidence'
         };
       }), ['Default calendar only, first 50 events; calendar entries alone are not action tasks.'], data.hasMore);
+    });
+  }
+
+  async function readFileContent({
+    driveId, itemId, approvedHost, confirmRead, signal
+  } = {}) {
+    const config = requireSource('files');
+    if (confirmRead !== true) fail('file_content_consent_required');
+    const pinned = config.files.find(item => item.driveId === driveId && item.itemId === itemId);
+    if (!pinned) fail('source_not_authorized');
+    let ownerApprovedHost;
+    try {
+      ownerApprovedHost = normalizeApprovedHost(approvedHost);
+    } catch (error) {
+      if (error instanceof SafeFileDownloadError) fail(error.code);
+      fail('invalid_content_host');
+    }
+    if (!customFileContentDownloader && !directFileEgressAllowed(allowDirectFileEgress)) {
+      fail('network_policy_unavailable');
+    }
+
+    return session(config, ['Files.Read'], signal, async (request, check, sessionSignal) => {
+      const metadata = await request(query(pinned.path, {
+        '$select': 'id,name,webUrl,lastModifiedDateTime,size,eTag,file,folder,remoteItem'
+      }));
+      if (metadata?.id !== pinned.itemId) fail('invalid_response');
+      if (metadata.folder || metadata.remoteItem ||
+          text(metadata.file?.mimeType).trim().toLowerCase() !== 'text/plain') {
+        fail('file_content_unavailable');
+      }
+      if (!Number.isSafeInteger(metadata.size) || metadata.size < 0) fail('invalid_response');
+      if (metadata.size > MAX_FILE_CONTENT_BYTES) fail('response_too_large');
+      if (!validRevisionTag(metadata.eTag)) fail('file_revision_unavailable');
+      try {
+        validateApprovedHttpsUrl(metadata.webUrl, ownerApprovedHost);
+      } catch (error) {
+        if (error instanceof SafeFileDownloadError) fail(error.code);
+        fail('blocked_request');
+      }
+      check();
+      const location = await request(`${pinned.path}/content`, {
+        accept: 'text/plain', manualRedirect: true
+      });
+      try {
+        validateApprovedHttpsUrl(location, ownerApprovedHost);
+      } catch (error) {
+        if (error instanceof SafeFileDownloadError) fail(error.code);
+        fail('blocked_request');
+      }
+      let content;
+      try {
+        content = await downloadFileContent({
+          url: location, approvedHost: ownerApprovedHost,
+          signal: sessionSignal, timeoutMs
+        });
+      } catch (error) {
+        if (error instanceof SafeFileDownloadError && FILE_DOWNLOAD_ERROR_CODES.has(error.code)) fail(error.code);
+        fail('transport_error');
+      }
+      check();
+      if (typeof content !== 'string') fail('invalid_response');
+      const contentBytes = Buffer.byteLength(content, 'utf8');
+      if (contentBytes > MAX_FILE_CONTENT_BYTES) fail('response_too_large');
+      if (Buffer.from(content, 'utf8').toString('utf8') !== content) fail('invalid_content_encoding');
+      if (contentBytes !== metadata.size) fail('invalid_response');
+      const verifiedMetadata = await request(query(pinned.path, {
+        '$select': 'id,size,eTag'
+      }));
+      if (!verifiedMetadata || !validRevisionTag(verifiedMetadata.eTag) ||
+          !Number.isSafeInteger(verifiedMetadata.size) || verifiedMetadata.size < 0) {
+        fail('file_revision_unavailable');
+      }
+      if (verifiedMetadata.id !== pinned.itemId ||
+          verifiedMetadata.eTag !== metadata.eTag || verifiedMetadata.size !== metadata.size) {
+        fail('file_revision_changed');
+      }
+      return result([{
+        driveId: pinned.driveId, id: metadata.id, name: text(metadata.name),
+        webLink: link(metadata.webUrl), lastModifiedDateTime: text(metadata.lastModifiedDateTime),
+        mimeType: 'text/plain', contentAvailable: true, content, contentType: 'text/plain',
+        eTag: metadata.eTag,
+        trust: 'untrusted-evidence', provenance: 'explicit-owner-approved-sharepoint-read'
+      }], [
+        'One explicitly selected text/plain item, read only after per-read owner approval.',
+        'Content is inert untrusted evidence; it is not automatically stored, uploaded, or submitted for inference.'
+      ]);
     });
   }
 
@@ -471,7 +592,10 @@ export function createMicrosoft365Connectors({
       teamsChats: Object.freeze({ read: options => readPinned('chats', 'Chat.Read', options) }),
       teamsChannels: Object.freeze({ read: options => readPinned('channels', 'ChannelMessage.Read.All', options) }),
       transcripts: Object.freeze({ read: options => readPinned('transcripts', 'OnlineMeetingTranscript.Read.All', options) }),
-      files: Object.freeze({ read: options => readPinned('files', 'Files.Read', options) }),
+      files: Object.freeze({
+        read: options => readPinned('files', 'Files.Read', options),
+        readContent: readFileContent
+      }),
       loop: unavailable, meetingInsights: unavailable
     })
   });

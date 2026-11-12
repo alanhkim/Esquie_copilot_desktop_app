@@ -1,3 +1,5 @@
+import { laneMove, matchingTasks } from './task-board.mjs';
+
 const $ = selector => document.querySelector(selector);
 const laneNames = { next: 'Next up', doing: 'In progress', waiting: 'Waiting', done: 'Completed' };
 const viewNames = {
@@ -19,6 +21,11 @@ let editingId = null;
 let importingSource = null;
 let sourceSettingsRendered = false;
 let outlookRequestId = crypto.randomUUID();
+let outlookMessageId = '';
+let outlookSourcePreview = null;
+let outlookSubmitting = false;
+const outlookSourceRecheckMessage = 'This historical preview cannot create a reply draft: its source-result revision is missing or invalid. Run a new bounded source check in Operations, then select the new mail preview in Activity. Your unsaved reply text is retained; copy it somewhere safe before clearing it to switch previews. No manual-ID fallback will be used.';
+const taskSourceRecheckMessage = 'This historical preview cannot create a task: its source-result revision is missing or invalid. Run a new bounded source check in Operations, then explicitly select its preview in Activity. Entered task text is retained; no manual-task fallback will be used.';
 let editingDraftId = null;
 let editingRevision = 0;
 let editingDraftRevision = 0;
@@ -31,6 +38,7 @@ let refreshing = false;
 let setupRevision = null;
 let setupRecord = null;
 let latestConnections = null;
+let draggedTask = null;
 let accessToken = '';
 let accessStorageWarning = '';
 const launchCapability = new URLSearchParams(location.hash.slice(1)).get('access');
@@ -85,6 +93,98 @@ function inertHttpUrl(value) {
   } catch { return ''; }
 }
 
+function validSourceResultRevision(value) {
+  return typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function outlookPreviewNeedsRecheck() {
+  return outlookSourcePreview !== null && !validSourceResultRevision(outlookSourcePreview.resultId);
+}
+
+function updateOutlookDraftAvailability() {
+  $('#outlook-draft-form button[type="submit"]').disabled = outlookSubmitting || outlookPreviewNeedsRecheck() ||
+    !latestConnections?.email?.available || !workspace.sourceConsent?.allowReplyDrafts;
+}
+
+function renderOutlookSourcePreview() {
+  const host = $('#outlook-source-preview');
+  host.replaceChildren();
+  updateOutlookDraftAvailability();
+  host.append(makeElement('h3', '', 'Selected source preview - read-only, incomplete evidence'));
+  host.append(makeElement('p', 'muted', 'Untrusted historical preview only, not a complete thread or verified participants. Review the current conversation and recipients in Outlook. This context does not authorize a draft.'));
+  if (!outlookSourcePreview) {
+    host.append(makeElement('p', '', 'No selected preview for this exact message ID. Select a mail preview in Activity to display its evidence.'));
+    return;
+  }
+  const preview = outlookSourcePreview;
+  if (outlookPreviewNeedsRecheck()) {
+    const warning = makeElement('p', 'job-error', outlookSourceRecheckMessage);
+    warning.setAttribute('role', 'status');
+    host.append(warning);
+  }
+  host.append(makeElement('p', 'source-excerpt', `Message ID: ${preview.messageId}\nSource item key: ${preview.sourceKey}\nSource check: ${preview.jobId}\nRecorded: ${preview.recordedAt || 'not provided'}\nCoverage: ${preview.coverage || 'not provided'}`));
+  host.append(makeElement('h4', 'source-excerpt', preview.title || 'Untitled source item'));
+  host.append(makeElement('p', 'source-excerpt', preview.excerpt || 'No excerpt provided in the selected preview.'));
+  host.append(makeElement('small', '', `Untrusted source evidence${preview.excerptTruncated ? ' - excerpt truncated at 600 characters' : ''}${preview.contentAvailable === false ? ' - metadata only, content unavailable' : ''}`));
+  for (const limitation of preview.limitations) host.append(makeElement('p', 'muted', limitation));
+  const url = inertHttpUrl(preview.url);
+  if (url) {
+    const link = makeElement('a', 'saved-link', 'Open original reference manually');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    host.append(link);
+  }
+}
+
+function selectOutlookSource(job, source, item) {
+  const preview = {
+    messageId: item.id, sourceKey: item.sourceKey, jobId: job.id, resultId: source.resultId,
+    recordedAt: job.updatedAt, title: item.title, excerpt: item.excerpt,
+    url: item.url, excerptTruncated: item.excerptTruncated,
+    contentAvailable: item.contentAvailable,
+    coverage: typeof source.coverage === 'object' ? source.coverage?.status : source.coverage,
+    limitations: [...(source.coverage?.limitations || [])]
+  };
+  const form = $('#outlook-draft-form');
+  if (outlookSubmitting) {
+    showNotice('Wait for the current draft request to finish. Do not retry an uncertain outcome.', true);
+    return;
+  }
+  if (JSON.stringify(preview) !== JSON.stringify(outlookSourcePreview)) {
+    if (form.elements.text.value) {
+      showNotice('Source not changed. Copy your unsaved reply somewhere safe, then clear the reply text before choosing another source.', true);
+      return;
+    }
+    outlookSourcePreview = preview;
+    outlookMessageId = item.id;
+    form.elements.messageId.value = item.id;
+    form.elements.replyAll.value = 'false';
+    outlookRequestId = crypto.randomUUID();
+    $('#outlook-draft-result').textContent = 'Source preview selected locally. No Outlook request has been made.';
+  }
+  renderOutlookSourcePreview();
+  navigate('drafts');
+  form.scrollIntoView({ block: 'center' });
+}
+
+function reconcileOutlookMessageId() {
+  const form = $('#outlook-draft-form');
+  if (form.elements.messageId.value === outlookMessageId) return true;
+  if (outlookSubmitting || form.elements.text.value) {
+    form.elements.messageId.value = outlookMessageId;
+    showNotice('Message ID not changed. Wait for any pending request, then copy and clear the unsaved reply before changing its target.', true);
+    return false;
+  }
+  outlookMessageId = form.elements.messageId.value;
+  outlookSourcePreview = null;
+  form.elements.replyAll.value = 'false';
+  outlookRequestId = crypto.randomUUID();
+  $('#outlook-draft-result').textContent = 'Message ID changed; selected evidence cleared. No Outlook request has been made.';
+  renderOutlookSourcePreview();
+  return true;
+}
+
 function formatDate(value) {
   if (typeof value !== 'string' || !value) return '';
   const date = new Date(value);
@@ -95,10 +195,7 @@ function renderTasks() {
   const host = $('#task-list');
   const query = $('#task-search').value.trim().toLocaleLowerCase();
   const showDone = $('#show-done').checked;
-  const matching = workspace.tasks.filter(task =>
-    (showDone || task.status !== 'done') &&
-    `${task.title}\n${task.details}`.toLocaleLowerCase().includes(query)
-  );
+  const matching = matchingTasks(workspace.tasks, workspace.conversations || [], query, showDone);
   const openCount = workspace.tasks.filter(task => task.status !== 'done').length;
   $('#open-count').textContent = String(openCount);
   $('#stat-open').textContent = String(openCount);
@@ -109,6 +206,21 @@ function renderTasks() {
   for (const status of ['next', 'doing', 'waiting', ...(showDone ? ['done'] : [])]) {
     const tasks = matching.filter(task => task.status === status);
     const lane = makeElement('section', 'task-lane');
+    if (status !== 'done') {
+      lane.addEventListener('dragover', event => {
+        if (!draggedTask || !laneMove(draggedTask, status, { drag: true })) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
+      });
+      lane.addEventListener('drop', event => {
+        event.preventDefault();
+        if (!draggedTask) return;
+        const task = draggedTask;
+        draggedTask = null;
+        const update = laneMove(task, status, { drag: true });
+        if (update) updateTask(task.id, update);
+      });
+    }
     const heading = makeElement('div', 'lane-heading');
     heading.append(makeElement('h2', '', laneNames[status]), makeElement('span', '', `${tasks.length} ${tasks.length === 1 ? 'task' : 'tasks'}`));
     lane.append(heading);
@@ -127,7 +239,7 @@ function renderTask(task) {
   const complete = makeElement('button', `task-marker${task.status === 'done' ? ' done' : ''}`, task.status === 'done' ? '✓' : '');
   complete.type = 'button';
   complete.setAttribute('aria-label', task.status === 'done' ? 'Reopen task' : 'Complete task');
-  complete.addEventListener('click', () => updateTask(task.id, { status: task.status === 'done' ? 'next' : 'done' }));
+  complete.addEventListener('click', () => updateTask(task.id, laneMove(task, task.status === 'done' ? 'next' : 'done')));
 
   const content = makeElement('div', 'task-content');
   content.append(makeElement('h3', 'task-title', task.title));
@@ -149,13 +261,48 @@ function renderTask(task) {
   notes.type = 'button';
   notes.addEventListener('click', () => openConversation(task));
   actions.append(edit, notes);
+  const moves = makeElement('div', 'task-moves');
+  const destination = makeElement('select', '');
+  destination.setAttribute('aria-label', `Destination lane for ${task.title}`);
+  for (const [status, name] of Object.entries(laneNames)) {
+    const option = makeElement('option', '', name);
+    option.value = status;
+    destination.append(option);
+  }
+  destination.value = task.status;
+  const move = makeElement('button', '', 'Move');
+  move.type = 'button';
+  move.disabled = true;
+  destination.addEventListener('change', () => {
+    move.disabled = destination.value === task.status;
+    move.textContent = destination.value === 'done' ? 'Complete task'
+      : task.status === 'done' ? `Reopen in ${laneNames[destination.value]}` : 'Move';
+  });
+  move.addEventListener('click', () => {
+    const update = laneMove(task, destination.value);
+    if (update) updateTask(task.id, update);
+  });
+  moves.append(destination, move);
+  if (task.status !== 'done') {
+    const handle = makeElement('span', 'task-drag', 'Drag to move');
+    handle.draggable = true;
+    handle.title = 'Drag between active lanes, or use the destination and Move controls';
+    handle.addEventListener('dragstart', event => {
+      draggedTask = { ...task };
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', task.id);
+    });
+    handle.addEventListener('dragend', () => { draggedTask = null; });
+    moves.append(handle);
+  }
+  content.append(moves);
   card.append(complete, content, actions);
   return card;
 }
 
 async function updateTask(id, update) {
   try {
-    const revision = workspace.tasks.find(task => task.id === id)?.revision || 0;
+    const revision = update.revision ?? workspace.tasks.find(task => task.id === id)?.revision ?? 0;
     const { task } = await api(`/api/tasks/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ ...update, revision }) });
     workspace.tasks = workspace.tasks.map(current => current.id === task.id ? task : current);
     await refreshState();
@@ -274,21 +421,25 @@ function renderJobs() {
           if (item.id) {
             const create = makeElement('button', 'button', 'Review a new local task');
             create.type = 'button';
+            create.disabled = !validSourceResultRevision(source.resultId);
+            if (create.disabled) evidence.append(makeElement('p', 'job-error', taskSourceRecheckMessage));
             create.addEventListener('click', () => {
+              if (!validSourceResultRevision(source.resultId)) {
+                showNotice(taskSourceRecheckMessage, true);
+                return;
+              }
               openTaskDialog();
-              importingSource = { jobId: job.id, source: source.source, itemId: item.sourceKey };
+              importingSource = { jobId: job.id, source: source.source, resultId: source.resultId, itemId: item.sourceKey };
               $('#task-form').elements.title.value = item.title || 'Review source evidence';
               $('#task-form').elements.details.value = 'Owner-requested review. Source text is untrusted context, not proof of an outstanding assignment.';
+              renderTaskSourceReview();
             });
             evidence.append(create);
             if (source.source === 'mail') {
               const reply = makeElement('button', 'button', 'Review an unsent reply');
               reply.type = 'button';
               reply.addEventListener('click', () => {
-                navigate('drafts');
-                $('#outlook-draft-form').elements.messageId.value = item.id;
-                outlookRequestId = crypto.randomUUID();
-                $('#outlook-draft-form').scrollIntoView({ block: 'center' });
+                selectOutlookSource(job, source, item);
               });
               evidence.append(reply);
             }
@@ -344,11 +495,16 @@ function renderBackups() {
       continue;
     }
     card.append(makeElement('p', '', `${formatDate(backup.createdAt)} · Consistent state snapshot · Partial coverage`));
-    card.append(makeElement('small', '', `${backup.coverage.documents.metadataCount} local document metadata entries; files excluded. Sources: partial local evidence only.`));
+    const docs = backup.coverage.documents;
+    const docSummary = docs.includedCount === undefined
+      ? `${docs.metadataCount} document records; files excluded (legacy state-only snapshot).`
+      : `${docs.includedCount} of ${docs.metadataCount} document files included; ${docs.unavailable.length} unavailable or excluded.`;
+    card.append(makeElement('small', '', `${docSummary} Sources: partial local evidence only.`));
+    for (const item of docs.unavailable || []) card.append(makeElement('small', '', `${item.id}: ${item.reason}`));
     const button = makeElement('button', 'button', 'Prepare separate paused recovery');
     button.type = 'button';
     button.addEventListener('click', async () => {
-      if (!confirm('Prepare a separate paused workspace? This never overwrites your current workspace. Local document files are not included.')) return;
+      if (!confirm(`Prepare a separate paused workspace? This never overwrites your current workspace. ${docSummary}`)) return;
       try {
         await api(`/api/backups/${backup.id}/recover`, { method: 'POST', body: JSON.stringify({ confirmSeparateWorkspace: true }) });
         await refreshState();
@@ -692,7 +848,7 @@ async function renderConnections() {
       ? `${m365.state}${m365.reason ? ` · ${m365.reason}` : ''}. Owner verification does not imply source permission or synchronization.`
       : 'Unavailable: this host has no trustworthy authenticated delegated token provider. IDs and consent alone cannot enable a connection.';
     $('#microsoft365-connect').disabled = !m365.hostAuthenticationAvailable;
-    $('#outlook-draft-form button[type="submit"]').disabled = !connections.email.available || !workspace.sourceConsent?.allowReplyDrafts;
+    updateOutlookDraftAvailability();
     $('#assistant-status').textContent = `Unavailable: ${connections.assistant.code}. No audited production runtime is connected; prompts are not submitted.`;
     if (!sourceSettingsRendered && (workspace.sourceConsent || workspace.sourceConfigurationDraft)) {
       const selected = workspace.sourceConsent || workspace.sourceConfigurationDraft;
@@ -707,6 +863,7 @@ async function renderConnections() {
     $('#output-directory').textContent = `Local destination: ${output.directory} · ${output.approved ? 'Owner-approved; rechecked on every write' : 'Not approved; file output disabled'}`;
   } catch (error) {
     latestConnections = null;
+    updateOutlookDraftAvailability();
     host.replaceChildren(makeElement('p', 'empty-panel', `Connection status unavailable: ${error.message}`));
   }
 }
@@ -755,6 +912,15 @@ function navigate(view) {
   if (location.hash !== `#${view}`) history.replaceState(null, '', `#${view}`);
 }
 
+function renderTaskSourceReview() {
+  const needsRecheck = importingSource !== null && !validSourceResultRevision(importingSource.resultId);
+  const status = $('#task-source-review');
+  status.hidden = !importingSource;
+  status.textContent = needsRecheck ? taskSourceRecheckMessage
+    : importingSource ? 'Selected source preview is incomplete, untrusted evidence, not proof of task ownership or an outstanding assignment. Its exact source-result revision and current owner are checked again when saving.' : '';
+  $('#task-form button[type="submit"]').disabled = needsRecheck;
+}
+
 function openTaskDialog(task = null) {
   importingSource = null;
   editingId = task?.id || null;
@@ -765,6 +931,7 @@ function openTaskDialog(task = null) {
   form.elements.status.value = task?.status || 'next';
   form.elements.priority.value = task?.priority || 'normal';
   form.elements.dueDate.value = task?.dueDate || '';
+  renderTaskSourceReview();
   $('#task-dialog-title').textContent = task ? 'A small change.' : 'Make a little progress.';
   $('#task-dialog').showModal();
   form.elements.title.focus();
@@ -780,6 +947,11 @@ window.addEventListener('hashchange', () => navigate(location.hash.slice(1) || '
 
 $('#task-form').addEventListener('submit', async event => {
   event.preventDefault();
+  if (importingSource && !validSourceResultRevision(importingSource.resultId)) {
+    renderTaskSourceReview();
+    showNotice(taskSourceRecheckMessage, true);
+    return;
+  }
   const form = event.currentTarget;
   const data = Object.fromEntries(new FormData(form));
   try {
@@ -793,6 +965,10 @@ $('#task-form').addEventListener('submit', async event => {
     await refreshState();
     $('#task-dialog').close();
   } catch (error) {
+    if (importingSource) {
+      $('#task-source-review').hidden = false;
+      $('#task-source-review').textContent = error.message;
+    }
     showNotice(error.message, true);
   }
 });
@@ -883,18 +1059,36 @@ $('#assistant-form').addEventListener('submit', async event => {
     showNotice('Assistant request queued; Activity will show its actual result.');
   } catch (error) { showNotice(error.message, true); }
 });
-$('#outlook-draft-form').addEventListener('input', () => { outlookRequestId = crypto.randomUUID(); });
+$('#outlook-draft-form').addEventListener('input', () => {
+  if (!outlookSubmitting && reconcileOutlookMessageId()) outlookRequestId = crypto.randomUUID();
+});
+$('#outlook-draft-form').addEventListener('change', () => {
+  if (!outlookSubmitting && reconcileOutlookMessageId()) outlookRequestId = crypto.randomUUID();
+});
 $('#outlook-draft-form').addEventListener('submit', async event => {
   event.preventDefault();
+  if (outlookSubmitting || !reconcileOutlookMessageId()) return;
+  if (outlookPreviewNeedsRecheck()) {
+    $('#outlook-draft-result').textContent = outlookSourceRecheckMessage;
+    showNotice('Reply draft blocked. Run a new bounded source check; your unsaved reply text has been retained.', true);
+    updateOutlookDraftAvailability();
+    return;
+  }
   const form = event.currentTarget;
-  const button = form.querySelector('button[type="submit"]');
-  button.disabled = true;
+  outlookSubmitting = true;
+  for (const control of form.elements) control.disabled = true;
   try {
     const result = await api('/api/mail/reply-drafts', {
       method: 'POST',
       body: JSON.stringify({
         messageId: form.elements.messageId.value, text: form.elements.text.value,
-        replyAll: form.elements.replyAll.value === 'true', requestId: outlookRequestId
+        replyAll: form.elements.replyAll.value === 'true', requestId: outlookRequestId,
+        ...(outlookSourcePreview ? {
+          sourceReference: {
+            jobId: outlookSourcePreview.jobId, resultId: outlookSourcePreview.resultId,
+            itemId: outlookSourcePreview.sourceKey
+          }
+        } : {})
       })
     });
     $('#outlook-draft-result').textContent = `${result.message} Subject: ${result.draft.subject}. Review the exact draft manually in Outlook.`;
@@ -902,7 +1096,12 @@ $('#outlook-draft-form').addEventListener('submit', async event => {
   } catch (error) {
     $('#outlook-draft-result').textContent = error.message;
     showNotice(error.message, true);
-  } finally { await renderConnections(); }
+  } finally {
+    outlookSubmitting = false;
+    for (const control of form.elements) control.disabled = false;
+    $('#outlook-draft-form button[type="submit"]').disabled = true;
+    await renderConnections();
+  }
 });
 
 $('#preferences-form').addEventListener('submit', async event => {
@@ -1022,11 +1221,12 @@ async function start() {
   }
 }
 
+renderOutlookSourcePreview();
 start();
 
 let lastBackgroundRefresh = 0;
 setInterval(async () => {
-  if (refreshing || document.hidden) return;
+  if (refreshing || document.hidden || draggedTask || document.activeElement?.closest('.task-moves')) return;
   const active = workspace.jobs?.some(job => ['queued', 'running'].includes(job.status));
   if (!active && Date.now() - lastBackgroundRefresh < 15_000) return;
   lastBackgroundRefresh = Date.now();

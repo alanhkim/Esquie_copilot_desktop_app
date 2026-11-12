@@ -18,7 +18,9 @@ const electronDist = join(electron, 'dist');
 const expected = [
   'src/server.mjs', 'src/store.mjs', 'src/worker.mjs', 'src/backups.mjs', 'src/monthly-outcomes-import.mjs',
   'src/local-output.mjs', 'src/private-storage.mjs', 'src/assistant/bridge.mjs',
-  'src/connectors/microsoft365.mjs', 'public/index.html', 'public/styles.css', 'public/app.js'
+  'src/connectors/microsoft365.mjs', 'src/connectors/safe-file-download.mjs',
+  'public/index.html', 'public/styles.css', 'public/app.js',
+  'public/task-board.mjs'
 ];
 const sentinels = [
   'src/private-sentinel.txt', 'src/private-sentinel.mjs',
@@ -87,7 +89,12 @@ try {
     "process.argv[1] = '';",
     "const { startServer } = await import(pathToFileURL(modulePath).href);",
     "const app = await startServer({ dataDir: process.argv[2], port: 0, workerIntervalMs: 0 });",
-    "try { if (!(await fetch(`${app.url}/api/health`)).ok) throw new Error('Health check failed.'); }",
+    "try {",
+    "  if (!(await fetch(`${app.url}/api/health`)).ok) throw new Error('Health check failed.');",
+    "  const module = await fetch(`${app.url}/task-board.mjs`);",
+    "  if (!module.ok || !/^text\\/javascript(?:;|$)/.test(module.headers.get('content-type'))) throw new Error('Task board module missing or not JavaScript.');",
+    "  if (!(await module.text()).includes('export function matchingTasks')) throw new Error('Task board module content missing.');",
+    "}",
     'finally { await app.close(); }'
   ].join('\n');
   await exec(process.execPath, ['--input-type=module', '-e', script, packagedServer, join(temp, 'data')], {

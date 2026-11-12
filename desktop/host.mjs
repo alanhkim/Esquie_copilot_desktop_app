@@ -1,6 +1,10 @@
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 
+export function workspaceDataDir({ dataDir, env = process.env, userDataDir }) {
+  return dataDir || env.ESQUIE_DATA_DIR || join(env.LOCALAPPDATA || userDataDir, 'EsquieLocal', 'Workspace');
+}
+
 export function isDashboardUrl(candidate, origin) {
   try {
     const url = new URL(candidate);

@@ -26,6 +26,21 @@ export interface ReadOptions {
   endDateTime?: string;
 }
 
+export interface FileContentReadOptions extends ReadOptions {
+  driveId: string;
+  itemId: string;
+  /** Canonical hostname explicitly approved by the owner for this read. */
+  approvedHost: string;
+  confirmRead: true;
+}
+
+export interface FileContentDownloadRequest {
+  url: string;
+  approvedHost: string;
+  signal: AbortSignal;
+  timeoutMs: number;
+}
+
 export interface Coverage {
   status: 'bounded' | 'partial';
   limitations: string[];
@@ -99,7 +114,11 @@ export interface FileEvidence extends Evidence {
   webLink: string;
   lastModifiedDateTime: string;
   mimeType: string;
-  contentAvailable: false;
+  contentAvailable: boolean;
+  content?: string;
+  eTag?: string;
+  contentType?: 'text/plain';
+  provenance?: 'explicit-owner-approved-sharepoint-read';
 }
 
 export interface ReadResult<T extends Evidence> extends Evidence {
@@ -174,7 +193,10 @@ export interface Microsoft365Connectors {
     teamsChats: ReadConnector<TeamsEvidence>;
     teamsChannels: ReadConnector<TeamsEvidence>;
     transcripts: ReadConnector<TranscriptEvidence>;
-    files: ReadConnector<FileEvidence>;
+    files: ReadConnector<FileEvidence> & {
+      /** Reads one selected text/plain item only after a per-read host approval. */
+      readContent(options: FileContentReadOptions): Promise<ReadResult<FileEvidence>>;
+    };
     loop: { read(options?: ReadOptions): Promise<never> };
     meetingInsights: { read(options?: ReadOptions): Promise<never> };
   };
@@ -184,4 +206,8 @@ export function createMicrosoft365Connectors(options?: {
   tokenProvider?: (request: TokenRequest) => Promise<DelegatedCredential>;
   transport?: typeof fetch;
   timeoutMs?: number;
+  /** Enable direct HTTPS only after trusted-host review confirms it is allowed by network policy. */
+  allowDirectFileEgress?: boolean;
+  /** Trusted host/test seam; the default downloader enforces the documented HTTPS boundary. */
+  fileContentDownloader?: (request: FileContentDownloadRequest) => Promise<string>;
 }): Microsoft365Connectors;

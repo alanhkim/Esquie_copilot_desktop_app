@@ -11,7 +11,11 @@ test is not proof of tenant permission, connectivity, licensing, or complete cov
 Import `createMicrosoft365Connectors` from `src/connectors/microsoft365.mjs`.
 The adjacent `microsoft365.d.mts` declares the complete TypeScript interface.
 Use this adapter instead of, not alongside, another Graph adapter for the same
-source and owner. No server, UI, database, queue, or desktop wiring is included.
+source and owner. In integrated app commit `ec17439`, the existing local server
+constructs this adapter, maps the selected connectors, gates connection on
+explicit owner consent, and queues bounded source refreshes. This change does
+not modify those host surfaces. The host still needs to supply
+`microsoft365Options.tokenProvider`; without it, connection remains disconnected.
 
 ```js
 import { createMicrosoft365Connectors } from './connectors/microsoft365.mjs';
@@ -52,12 +56,19 @@ The existing core contract is preserved:
   `{items, verifiedOwner: true, coverage, hasMore, trust: 'untrusted-evidence'}`.
 - `connectors.mail.createReplyDraft({messageId,text,replyAll,signal})` returns
   `{id,subject,webLink,isDraft:true,verifiedOwner:true,source:{id,subject,webLink},conversationId}`.
+- `connectors.files.readContent({driveId,itemId,approvedHost,confirmRead:true,signal})`
+  returns one `text/plain` `FileEvidence` with in-memory `content`,
+  `contentAvailable:true`, `contentType:'text/plain'`, the verified Graph `eTag`,
+  explicit provenance and `trust:'untrusted-evidence'`. It accepts only IDs
+  already selected at connect.
 - `coverage` is **an object**, not a completion percentage:
   `{status:'bounded'|'partial',limitations:string[],gaps:[{sourceIndex,code}]}`.
   `bounded` means only the stated bounded request was completed, never that a
   mailbox, channel, tenant, or outstanding-task review is complete.
 - `status()` is a local snapshot with `state`, `reason`, `verifiedOwner`,
-  `identity`, `enabled`, and `unavailable`. `enabled` uses configuration keys
+  `identity`, `enabled`, and `unavailable`. The standalone selected-content
+  adapter does not mean the host app has a content-read route or display.
+  `enabled` uses configuration keys
   `mail`, `calendar`, `chats`, `channels`, `transcripts`, `files`.
   This is not a last-sync timestamp or a per-source permission check.
 - `disconnect()` invalidates the session and aborts active requests.
@@ -65,8 +76,13 @@ The existing core contract is preserved:
 The host must map its source names to `mail`, `calendar`, `teamsChats`,
 `teamsChannels`, `transcripts`, and `files`. `loop.read()` and
 `meetingInsights.read()` explicitly reject with `source_unavailable`, without
-accessing the network. A disconnected adapter rejects other reads with
-`disconnected`; a connected but unselected source rejects `source_not_authorized`.
+accessing the network. The adapter exposes the optional
+`files.readContent({driveId,itemId,approvedHost,confirmRead:true,signal})` operation
+for one explicitly selected plain-text file. The integrated app does not yet
+expose a user route or local display for this operation; its worker remains
+metadata-only and `status().unavailable` includes `fileContent`. A disconnected
+adapter rejects other reads with `disconnected`; a connected but unselected
+source rejects `source_not_authorized`.
 
 ## Authentication, authorization, and trust boundary
 
@@ -113,12 +129,16 @@ SQLite, queue, telemetry, browser storage, or a connector result.
 
 ## Supported operations and exact coverage
 
-All HTTP calls use `https://graph.microsoft.com/v1.0` only. National clouds are
-not supported. Only closed GET operations and the two reply-draft POST actions
-exist; no generic request surface, PATCH, DELETE, send, event mutation, Teams
-mutation, Planner/To Do, reporting, or cloud-upload operation is exposed.
-Path segments are validated/encoded, HTTP redirects are refused, and response
-continuation URLs and download URLs are never followed.
+Graph API calls use `https://graph.microsoft.com/v1.0` only; national Graph
+clouds are not supported. The optional content downloader is restricted to the
+exact owner-approved SharePoint hostname. Only closed GET operations and the two
+reply-draft POST actions exist; no generic request surface, PATCH, DELETE, send,
+event mutation, Teams mutation, Planner/To Do, reporting, or cloud-upload
+operation is exposed.
+Path segments are validated/encoded and ordinary API redirects are refused.
+The optional selected-file path handles one Graph 302 manually, validates the
+destination, then makes one separate credentialless pinned HTTPS request;
+continuation URLs and any further redirects are never followed.
 
 | Adapter | Documented route, after `/v1.0` | Delegated scopes in addition to `User.Read` | Coverage |
 |---|---|---|---|
@@ -127,7 +147,8 @@ continuation URLs and download URLs are never followed.
 | `teamsChats.read` | `GET /chats/{chatId}/messages` | `Chat.Read` | At most 50 messages for each explicitly approved chat; no chat discovery. |
 | `teamsChannels.read` | `GET /teams/{teamId}/channels/{channelId}/messages` | `ChannelMessage.Read.All` | At most 50 root messages per explicitly approved channel; no replies or channel discovery. |
 | `transcripts.read` | `GET /me/onlineMeetings/{meetingId}/transcripts/{transcriptId}/content` | `OnlineMeetingTranscript.Read.All` | Exact approved meeting/transcript pairs, `Accept: text/vtt`. No automatic resolution from a calendar join URL. |
-| `files.read` | `GET /drives/{driveId}/items/{itemId}` | `Files.Read` | Exact approved OneDrive/SharePoint items, selected metadata only. `contentAvailable:false`; no download URLs returned. Access may require a separately approved broader read permission or tenant/container configuration; denial stays visible. |
+| `files.read` | `GET /drives/{driveId}/items/{itemId}` | `Files.Read` | Exact approved OneDrive/SharePoint items, selected metadata only. `contentAvailable:false`; content and download URLs are not returned. Access may require a separately approved broader read permission or tenant/container configuration; denial stays visible. |
+| `files.readContent` | `GET /drives/{driveId}/items/{itemId}` before and after, `GET .../content` (manual 302), one credentialless pinned HTTPS request | `Files.Read` | One selected `text/plain` item only; requires `confirmRead:true`, exact owner-approved host match, stable eTag/size and host-approved direct egress. |
 | `mail.createReplyDraft` | `GET /me/messages/{sourceId}`, `POST /me/messages/{sourceId}/createReply` or `/createReplyAll`, `GET /me/messages/{draftId}` | `Mail.ReadWrite` | Explicit draft opt-in required; never sends. |
 
 Source arrays are limited to 10 entries each. A whole operation, including token
@@ -142,6 +163,72 @@ No continuation is currently exposed or consumed. For pinned sources,
 individual 403/404 responses become explicit `coverage.gaps`; other failures
 reject the operation. A rejected operation supplies no successful scan timestamp.
 A partial result can have zero items: it is not proof there is no work.
+
+### Selected text content adapter and host boundary
+
+The integrated worker currently makes a bounded metadata read for each explicitly
+selected OneDrive/SharePoint item; that is not document content. Reference workflow
+documentation describes notes/documents as reads for a specific request or
+configured source, not a blanket file/notebook sync, and saved Loop pages as
+owner-opted-in reads. This connector does not claim that broader content workflow.
+
+Microsoft Graph's documented drive-item `/content` API responds with `302 Found`
+to a short-lived preauthenticated download URL; the URL does not require a Graph
+bearer token. The adapter's `readContent()` uses a separate, manual redirect path:
+the bearer token is sent only to fixed Graph endpoints. The signed URL is
+transient in memory as the storage request target, never returned or persisted;
+the default downloader does not log it. A trusted custom downloader receives the
+URL and must uphold the same no-log/no-persist rule.
+The source selection currently contains only drive/item IDs; the integrated
+server's strict consent schema accepts no owner-approved content host, and its
+worker only invokes the metadata `read()` operation. Thus there is no separate
+owner-triggered, CSRF-gated content-read action or exact-host approval to honor.
+Do not treat Graph's returned `webUrl` as owner approval. For standalone host
+integration, every read requires the exact selected `driveId`/`itemId`, an
+owner-approved canonical hostname, and `confirmRead:true`. The host must present
+that hostname in the owner-controlled action; source text, metadata and the
+download URL cannot supply approval.
+
+Even with such a host approval, the connector must require the selected item's
+validated HTTPS `webUrl` hostname to match the separately owner-approved exact
+hostname, and the content redirect hostname to match both. Reject userinfo,
+non-default ports, IP literals, non-HTTPS URLs and all subsequent redirects;
+host mismatch is unavailable, not a reason to follow a different host. The
+standalone transport resolves IPv4 only, rejects special-use/non-global ranges
+(including mixed public/private answers), pins a validated address in the HTTPS
+lookup callback, retains normal TLS hostname/certificate verification and
+rejects all response redirects. It sends only `Accept` and
+`Accept-Encoding: identity` to storage, with no authorization or cookie header.
+The signed URL itself is necessarily the request target. Compressed or
+non-`text/plain` responses and any declared charset other than UTF-8 are
+rejected; an absent charset is treated as UTF-8. Content is bounded to 1 MiB
+and the operation to the adapter timeout, and decoded with fatal UTF-8
+validation. The adapter requires a valid Graph `eTag` before download and
+re-reads item metadata afterward; it returns content only if the `eTag` and
+size remain unchanged. Missing revision evidence or a changed item fails
+visibly.
+
+Direct egress is disabled by default. A trusted host must set
+`allowDirectFileEgress:true` only after verifying that direct HTTPS is permitted
+by the host's network policy; this option applies only to the built-in downloader.
+Standard HTTP(S)/ALL_PROXY variables, npm `*_proxy` variables (upper- and
+lowercase), `GLOBAL_AGENT_HTTP_PROXY`/`GLOBAL_AGENT_HTTPS_PROXY`, Node's
+environment-proxy flags, and `NODE_TLS_REJECT_UNAUTHORIZED=0` cause
+`network_policy_unavailable`; this adapter does not clear proxy settings,
+disable TLS, or fall back to another route. On Windows, the built-in direct
+downloader always fails closed because Node's `https.request` cannot establish
+or preserve system/enterprise proxy policy.
+Proxy transport is unsupported here because its DNS, destination pinning and TLS
+boundary are not established. A custom downloader is trusted host code and must
+independently prove equivalent destination, TLS, proxy and credential boundaries.
+
+The adapter returns the selected text only in memory as
+`trust:'untrusted-evidence'` with explicit provenance. The host still needs a
+local-origin/CSRF-gated owner action, and a display that renders content as
+inert escaped plain text (for example `textContent` in a `<pre>`), not HTML.
+Do not pass it to the worker, task discovery, an assistant/model, or cloud
+storage. Other file formats, arbitrary hosts, Loop content and converted-format
+reads remain unavailable. No live redirect or user file was accessed.
 
 ### Opaque identifier compatibility boundary
 
@@ -218,6 +305,47 @@ Have the owner inspect Outlook and reconcile through an approved read flow.
 Concurrent draft creation for the same source ID in one instance is rejected
 with `draft_in_progress`; this is not durable deduplication.
 
+The local host's `POST /api/mail/reply-drafts` accepts an optional
+`sourceReference: {jobId,resultId,itemId}` for preview-driven requests: UUID
+source-refresh job/result identifiers and a 64-character hexadecimal source item
+key. Each successful worker source result receives a fresh local `resultId`,
+including an explicit retry of the same job. Before reserving any draft operation
+or calling Graph, the host requires an active verified connection, an exact mail
+result/item/message-ID match and equality between the stored result's
+`ownerReference` and the currently verified identity. Missing, replaced or
+other-owner evidence is rejected without network requests or ledger writes.
+Invalid/incomplete references are never treated as manually entered IDs.
+Existing previews without `resultId` cannot authorize a preview-driven request;
+run a new explicit bounded source check. Requests with no `sourceReference`
+preserve the manual-ID flow and make no claim of matching preview evidence.
+References are included in durable operation fingerprints so changing references
+cannot repurpose an existing request ID; same-owner/message deduplication and
+uncertain-outcome blocking apply across both flows.
+
+Explicit local task creation from Activity uses
+`POST /api/tasks/from-evidence` with `{jobId,source,resultId,itemId}` plus the
+owner-entered task fields. The result revision is mandatory, including for a
+deduplicated task. After reading the complete request body, the host looks up the
+current stored source-refresh job, exact source/result revision and item, then
+checks the current verified owner against the stored result's `ownerReference`.
+Validation, canonical-key deduplication and creation have no intervening awaits.
+A retried/replaced result, missing evidence, legacy reference or switched/
+disconnected owner is rejected without source network access or task mutation;
+neither the UI nor server falls back to a manual task. The UI disables legacy
+preview task actions with an explicit bounded-recheck explanation and preserves
+entered task text after rejection. A separately selected newer valid result for
+the same owner/source/item can deduplicate an existing completed task without
+reopening it or replacing its original evidence. Source evidence is never proof
+of task ownership or an outstanding assignment.
+
+Newly created task evidence durably retains
+`sourceReference: {jobId,resultId,itemId}` using only the already-validated local
+job UUID, result UUID and hashed source item key. These accompany the selected
+title/link/excerpt snapshot, not credentials or a new source read. Restart and
+later source-job retries do not replace these references or the saved evidence;
+deduplication retains the original task unchanged. Legacy evidence without these
+references is preserved as-is, with no inferred or fabricated provenance.
+
 The host remains responsible for durable operation deduplication, checking current
 thread context/sent replies and suitable existing drafts, task ownership,
 unfinished-work evidence, citation provenance, participant review, correct reply-all
@@ -238,19 +366,21 @@ body, bearer token, or HTTP response. Suggested presentation:
 |---|---|
 | `disconnected`, `consent_required`, `token_provider_unavailable`, `identity_required` | Disconnected; owner connection or host authentication integration required. |
 | `authentication_required`, `identity_mismatch` | Connection invalid; explicitly reconnect the verified owner. |
-| `permission_required`, `permission_denied`, `source_not_authorized`, `draft_consent_required` | Not authorized for this source/operation; do not silently broaden permission. |
-| `source_unavailable` | Unsupported, missing, expired, or inaccessible; do not show successful sync. |
+| `permission_required`, `permission_denied`, `source_not_authorized`, `draft_consent_required`, `file_content_consent_required` | Not authorized for this source/operation; do not silently broaden permission. |
+| `source_unavailable`, `file_content_unavailable`, `file_revision_unavailable`, `file_revision_changed` | Unsupported, missing, expired, inaccessible, or changed during read; do not show successful sync. |
+| `network_policy_unavailable` | Direct egress is not approved or proxy configuration prevents the pinned route; do not retry through another route. |
 | `throttled`, `timeout`, `transport_error`, `service_error`, `cancelled` | Attempt did not complete; no automatic retry or complete-coverage claim. |
-| `invalid_response`, `response_too_large`, `invalid_source_message`, `draft_verification_failed` | Result is not verified; preserve previous successful state and surface the gap. |
-| `invalid_source_id`, `invalid_source_configuration`, `invalid_time_window`, `invalid_timeout`, `invalid_draft`, `blocked_request`, `draft_in_progress` | Reject the attempted operation; fix local configuration/input or reconcile pending work. |
+| `invalid_response`, `response_too_large`, `invalid_content_encoding`, `invalid_source_message`, `draft_verification_failed` | Result is not verified; preserve previous successful state and surface the gap. |
+| `invalid_source_id`, `invalid_source_configuration`, `invalid_content_host`, `invalid_content_downloader`, `invalid_time_window`, `invalid_timeout`, `invalid_draft`, `blocked_request`, `draft_in_progress` | Reject the attempted operation; fix local configuration/input or reconcile pending work. |
 
 Always prioritize `outcomeUnknown` when presenting a draft failure.
 
 ## Remaining work, intentionally not fabricated
 
-- Host app registration, authenticated delegated token provider, owner consent UI,
-  secure cache integration, server/queue wiring, and live tenant verification.
-  This module alone cannot enable a real connection.
+- Host app registration, authenticated delegated token provider, secure cache
+  integration and live tenant verification. Local server consent and bounded
+  source-refresh queue wiring exists at integrated commit `ec17439`; this
+  connector alone cannot enable a real connection.
 - Host task discovery and source-to-task citations; no model, task heuristic,
   autonomous execution, queue or schedule is hidden inside this connector.
 - Safe paginated inbox/thread/draft reads and durable draft reconciliation are
@@ -261,9 +391,11 @@ Always prioritize `outcomeUnknown` when presenting a draft failure.
   retained; there is no silent fallback to a different attribution format.
 - Meeting AI insights are explicitly unavailable pending a separately reviewed
   documented API, licensing/permission model and owner-approved scope.
-- SharePoint/OneDrive document **content** is not implemented. Graph metadata
-  success must not appear as content sync. A future bounded content reader needs
-  an approved redirect/download policy, file-type parser and source-level consent.
+- The selected `text/plain` content adapter is implemented, but no host route,
+  per-read UI approval or local display is wired. The app worker remains
+  metadata-only; do not claim content sync. Other formats, unattended reads and
+  host-UI exposure remain unavailable until local-origin/CSRF gates, explicit
+  owner approval, inert rendering and proxy-policy review are wired.
 - Loop page content is explicitly unavailable. It is not inferred from a drive
   item's filename or metadata, and no desktop/browser reader is launched.
 - No business-reporting integration or writes, Teams writes, Planner/To Do,
@@ -386,7 +518,8 @@ or has been verified against a live tenant.
 ## Verification and official references
 
 Run `node --test test\safe-source-connectors.test.mjs`. Tests use fake principals,
-messages and injected transports only; they do not obtain tokens or contact Graph.
+messages, token providers, Graph transports, DNS results and HTTPS sockets; they
+do not obtain real tokens, contact Graph or fetch a user file.
 
 Public Microsoft documentation consulted 2026-11-11:
 
@@ -397,6 +530,10 @@ Public Microsoft documentation consulted 2026-11-11:
 - [Channel root messages](https://learn.microsoft.com/en-us/graph/api/channel-list-messages?view=graph-rest-1.0)
 - [Transcript content and tenant controls](https://learn.microsoft.com/en-us/graph/api/calltranscript-get?view=graph-rest-1.0)
 - [Drive item metadata](https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0)
+- [IANA IPv4 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml)
+- [Download drive item content and preauthenticated redirect behavior](https://learn.microsoft.com/en-us/graph/api/driveitem-get-content?view=graph-rest-1.0)
+- [Convert drive item content formats and redirect behavior](https://learn.microsoft.com/en-us/graph/api/driveitem-get-content-format?view=graph-rest-1.0)
+- [Drive item content and metadata model](https://learn.microsoft.com/en-us/graph/api/resources/driveitem?view=graph-rest-1.0)
 - [Create reply draft](https://learn.microsoft.com/en-us/graph/api/message-createreply?view=graph-rest-1.0)
 - [Create reply-all draft](https://learn.microsoft.com/en-us/graph/api/message-createreplyall?view=graph-rest-1.0)
 - [Immutable Outlook IDs](https://learn.microsoft.com/en-us/graph/outlook-immutable-id)

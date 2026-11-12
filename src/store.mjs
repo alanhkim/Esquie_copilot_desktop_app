@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
+import { closeSync, openSync, writeFile as writeFileCallback } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import { chmod, lstat, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, open, readFile, readdir, rm } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { assertPrivateDataDirectory, assertPrivateStorage, runSystemPowerShell } from './private-storage.mjs';
@@ -11,6 +12,7 @@ const applicationId = 0x45535155;
 const schemaFingerprint = '86f3f6d1d89f9cca72d3a47b8f298e37481bae55781d74752427d263b3ad8af2';
 const unowned = 'Workspace ownership is not established; existing files were left unchanged. See the documented legacy adoption procedure.';
 const execute = promisify(execFile);
+const writeOpenFile = promisify(writeFileCallback);
 
 export function newWorkspace() {
   return {
@@ -51,21 +53,23 @@ function normalizeState(value) {
   return state;
 }
 
-async function acquireLock(root) {
+async function acquireLock(root, assertOutput) {
   const path = join(root, 'workspace.lock');
   const identity = { pid: process.pid, token: randomUUID() };
-  let handle;
+  let descriptor;
   try {
-    handle = await open(path, 'wx', 0o600);
-    await handle.writeFile(JSON.stringify(identity));
-    await handle.close();
+    assertOutput?.(path);
+    descriptor = openSync(path, 'wx', 0o600);
+    await writeOpenFile(descriptor, JSON.stringify(identity));
+    closeSync(descriptor);
+    descriptor = undefined;
     return async () => {
       const current = parseSavedJson(await readFile(path, 'utf8'), 'workspace lock');
       if (current.token !== identity.token) throw new Error('Workspace lock ownership changed.');
       await rm(path);
     };
   } catch (error) {
-    if (handle) await handle.close();
+    if (descriptor !== undefined) closeSync(descriptor);
     if (error.code === 'EEXIST') throw new Error('This workspace is already open in another process or has an unverified lock; it was left unchanged.');
     throw error;
   }
@@ -136,9 +140,13 @@ $disk.VolumeSerialNumber.ToUpperInvariant()
   } finally { await handle.close(); }
 }
 
-async function writeOwnership(root) {
+async function writeOwnership(root, assertOutput) {
   const identity = await fileIdentity(join(root, 'workspace.sqlite'));
-  await writeFile(join(root, 'workspace.owner'), JSON.stringify({ kind: 'esquie-local-workspace', version: 1, ...identity }), { flag: 'wx', mode: 0o600 });
+  const path = join(root, 'workspace.owner');
+  assertOutput?.(path);
+  const descriptor = openSync(path, 'wx', 0o600);
+  try { await writeOpenFile(descriptor, JSON.stringify({ kind: 'esquie-local-workspace', version: 1, ...identity })); }
+  finally { closeSync(descriptor); }
 }
 
 async function inspectOwnership(root) {
@@ -276,18 +284,35 @@ export async function adoptLegacyWorkspace({ source, destination, confirmed }) {
   await store.close();
 }
 
-export async function openRecoveredSnapshot(root) {
+export async function openRecoveredSnapshot(root, { prepareState, assertOutput } = {}) {
   const path = join(root, 'workspace.sqlite');
   if ((await readdir(root)).length !== 1 || !await regularFile(path)) throw new Error('Recovery destination is not an exclusive snapshot.');
   await inspectHeader(path, applicationId);
+  assertOutput?.(path);
   const readonly = new DatabaseSync(path, { readOnly: true });
-  try { inspectOpenedDatabase(readonly, applicationId); }
+  let state;
+  try { state = inspectOpenedDatabase(readonly, applicationId); }
   finally { readonly.close(); }
-  await writeOwnership(root);
-  return openStore(root);
+  if (prepareState) {
+    prepareState(state);
+    assertOutput?.(path);
+    const database = new DatabaseSync(path);
+    try {
+      database.exec('BEGIN IMMEDIATE');
+      try {
+        database.prepare('UPDATE workspace SET body=? WHERE id=1').run(JSON.stringify(state));
+        database.exec('COMMIT');
+      } catch (error) {
+        database.exec('ROLLBACK');
+        throw error;
+      }
+    } finally { database.close(); }
+  }
+  await writeOwnership(root, assertOutput);
+  return openStore(root, { assertOutput });
 }
 
-export async function openStore(root, { initialState } = {}) {
+export async function openStore(root, { initialState, assertOutput } = {}) {
   const path = join(root, 'workspace.sqlite');
   const existing = await regularFile(path);
   if (existing) {
@@ -299,7 +324,7 @@ export async function openStore(root, { initialState } = {}) {
   } else if ((await readdir(root)).length) {
     throw new Error(unowned);
   }
-  const release = await acquireLock(root);
+  const release = await acquireLock(root, assertOutput);
   let database;
   try {
     if (existing) {
@@ -310,14 +335,17 @@ export async function openStore(root, { initialState } = {}) {
       await inspectWal(path);
     } else {
       if ((await readdir(root)).some(name => name !== 'workspace.lock')) throw new Error(unowned);
-      const file = await open(path, 'wx', 0o600);
-      await file.close();
+      assertOutput?.(path);
+      const file = openSync(path, 'wx', 0o600);
+      closeSync(file);
     }
     if (existing) {
+      assertOutput?.(path);
       const readonly = new DatabaseSync(path, { readOnly: true });
       try { inspectOpenedDatabase(readonly, applicationId); }
       finally { readonly.close(); }
     }
+    assertOutput?.(path);
     database = new DatabaseSync(path);
     if (!existing) {
       database.exec('BEGIN IMMEDIATE');
@@ -331,7 +359,7 @@ export async function openStore(root, { initialState } = {}) {
       }
     }
     inspectOpenedDatabase(database, applicationId);
-    if (!existing) await writeOwnership(root);
+    if (!existing) await writeOwnership(root, assertOutput);
     database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;');
     const row = database.prepare('SELECT body FROM workspace WHERE id=1').get();
     let state = normalizeState(parseSavedJson(row.body, 'workspace'));
@@ -351,6 +379,7 @@ export async function openStore(root, { initialState } = {}) {
       state = next;
       return result;
     }
+    assertOutput?.(path);
     update(next => {
       for (const operation of next.draftOperations) {
         if (operation.status === 'creating') operation.status = 'unknown';

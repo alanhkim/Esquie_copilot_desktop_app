@@ -14,6 +14,8 @@ test('literal runtime resource allowlist forms a standalone backend without Elec
     { from: '../src', to: 'workspace/src' },
     { from: '../public', to: 'workspace/public' }
   ]);
+  assert.ok(resources.find(resource => resource.to === 'workspace/public').filter.includes('task-board.mjs'));
+  assert.ok(resources.find(resource => resource.to === 'workspace/src').filter.includes('connectors/safe-file-download.mjs'));
   for (const resource of resources) {
     assert.ok(Array.isArray(resource.filter) && resource.filter.length > 0);
     for (const file of resource.filter) {
@@ -36,9 +38,12 @@ test('literal runtime resource allowlist forms a standalone backend without Elec
     assert.equal((await fetch(`${app.url}/api/health`)).ok, true);
     assert.equal((await fetch(`${app.url}/api/state`)).status, 401);
     assert.equal((await fetch(`${app.url}/api/state`, { headers: { 'X-Esquie-Access': app.accessToken } })).ok, true);
-    for (const asset of ['/', '/app.js', '/styles.css']) {
+    for (const asset of ['/', '/app.js', '/styles.css', '/task-board.mjs']) {
       assert.equal((await fetch(`${app.url}${asset}`)).ok, true, asset);
     }
+    const module = await fetch(`${app.url}/task-board.mjs`);
+    assert.match(module.headers.get('content-type'), /^text\/javascript(?:;|$)/);
+    assert.equal(await module.text(), await readFile(join(desktop, '..', 'public', 'task-board.mjs'), 'utf8'));
   } finally {
     try {
       if (app) await app.close();

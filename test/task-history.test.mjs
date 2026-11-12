@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { adoptLegacyWorkspace, newWorkspace } from '../src/store.mjs';
 import { startServer } from '../src/server.mjs';
+import { laneMove, matchingTasks } from '../public/task-board.mjs';
 
 async function setup(t, legacy) {
   const root = await mkdtemp(join(tmpdir(), 'esquie-task-history-'));
@@ -59,8 +60,13 @@ test('real task creation, completion/reopen, changes, notes and deduplicated evi
 
 test('legacy tasks keep known creation dates/completed state and never receive invented dates or past transitions', async t => {
   const legacy = newWorkspace();
+  const legacyEvidence = {
+    id: randomUUID(), title: 'Fake legacy source preview', url: 'https://example.invalid/legacy-source',
+    note: 'Historical synthetic evidence with no recorded source-result reference.',
+    provenance: 'authorized-source-untrusted-evidence', source: 'mail', createdAt: '2025-01-02T03:04:05.000Z'
+  };
   legacy.tasks = [
-    { id: randomUUID(), title: 'Fake old undated completion', status: 'done', revision: 1, evidence: [] },
+    { id: randomUUID(), title: 'Fake old undated completion', status: 'done', revision: 1, evidence: [legacyEvidence] },
     { id: randomUUID(), title: 'Fake old dated task', status: 'next', revision: 1, evidence: [], createdAt: '2025-01-02T03:04:05.000Z' }
   ];
   const context = await setup(t, legacy);
@@ -69,6 +75,8 @@ test('legacy tasks keep known creation dates/completed state and never receive i
   assert.equal(state.tasks[0].status, 'done');
   assert.equal(state.tasks[0].createdAt, undefined);
   assert.deepEqual(state.tasks[0].history, []);
+  assert.deepEqual(state.tasks[0].evidence, [legacyEvidence]);
+  assert.equal(Object.hasOwn(state.tasks[0].evidence[0], 'sourceReference'), false);
   assert.equal(state.tasks[1].createdAt, '2025-01-02T03:04:05.000Z');
   assert.deepEqual(state.tasks[1].history, []);
   await context.request(`/api/tasks/${state.tasks[0].id}`, { status: 'next', revision: 1 }, 'PATCH');
@@ -76,4 +84,30 @@ test('legacy tasks keep known creation dates/completed state and never receive i
   assert.deepEqual(state.tasks[0].history.map(event => event.kind), ['reopened']);
   assert.equal(state.tasks[0].createdAt, undefined);
   assert.equal(await readFile(join(context.source, 'workspace.json'), 'utf8'), JSON.stringify(legacy));
+});
+
+test('local lane moves persist history, reject stale revisions and preserve completed tasks during note/evidence search', async t => {
+  const context = await setup(t);
+  const created = await (await context.request('/api/tasks', { title: 'Fake movable task' })).json();
+  const snapshot = created.task;
+  const patch = update => context.request(`/api/tasks/${snapshot.id}`, update, 'PATCH');
+  let task = (await (await patch(laneMove(snapshot, 'waiting'))).json()).task;
+  assert.equal(task.status, 'waiting');
+  assert.equal((await patch(laneMove(snapshot, 'doing'))).status, 409);
+  assert.equal((await context.state()).tasks[0].status, 'waiting');
+  task = (await (await patch(laneMove(task, 'done'))).json()).task;
+  const completedAt = task.completedAt;
+  await context.request(`/api/tasks/${task.id}/conversation`, { text: 'Fake searchable conversation' });
+  await context.request(`/api/tasks/${task.id}/evidence`, { title: 'Fake proof', url: 'https://example.invalid/unique-proof', note: 'Fake evidence needle' });
+  await context.restart();
+  const state = await context.state();
+  assert.equal(state.tasks[0].status, 'done');
+  assert.equal(state.tasks[0].completedAt, completedAt);
+  assert.deepEqual(matchingTasks(state.tasks, state.conversations, 'searchable conversation', false), []);
+  assert.equal(matchingTasks(state.tasks, state.conversations, 'searchable conversation', true)[0].id, task.id);
+  assert.equal(matchingTasks(state.tasks, state.conversations, 'evidence needle', true)[0].id, task.id);
+  assert.equal(matchingTasks(state.tasks, state.conversations, 'unique-proof', true)[0].id, task.id);
+  const reopened = await (await patch(laneMove(state.tasks[0], 'doing'))).json();
+  assert.equal(reopened.task.completedAt, null);
+  assert.deepEqual(reopened.task.history.map(event => event.kind), ['created', 'status-changed', 'completed', 'note-added', 'evidence-added', 'reopened']);
 });

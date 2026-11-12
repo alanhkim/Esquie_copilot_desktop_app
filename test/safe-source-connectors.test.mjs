@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import { ConnectorError, createMicrosoft365Connectors } from '../src/connectors/microsoft365.mjs';
+import {
+  createSafeFileDownloader, directFileEgressAllowed, environmentProxyConfigured,
+  MAX_FILE_CONTENT_BYTES, SafeFileDownloadError
+} from '../src/connectors/safe-file-download.mjs';
 
 const identity = { tenantId: 'fake-tenant', userId: 'fake-owner' };
 const scopes = [
@@ -19,7 +25,7 @@ const draft = {
   uniqueBody: { contentType: 'text', content: 'Fake' }
 };
 
-function harness({ handle, auth, tokenProvider, timeoutMs = 1000 } = {}) {
+function harness({ handle, auth, tokenProvider, timeoutMs = 1000, fileContentDownloader } = {}) {
   const calls = [];
   const tokenCalls = [];
   const adapter = createMicrosoft365Connectors({
@@ -31,6 +37,7 @@ function harness({ handle, auth, tokenProvider, timeoutMs = 1000 } = {}) {
         ...identity, scopes: [...scopes], ...auth
       };
     }),
+    fileContentDownloader,
     transport: async (url, options) => {
       calls.push({ url: new URL(url), options });
       if (new URL(url).pathname === '/v1.0/me') {
@@ -47,6 +54,44 @@ function harness({ handle, auth, tokenProvider, timeoutMs = 1000 } = {}) {
       sources: { mail: true, calendar: true }, ...options
     })
   };
+}
+
+function mockedHttps({ body = Buffer.from('synthetic file'), statusCode = 200, headers = {} } = {}) {
+  const calls = [];
+  const pinned = [];
+  const request = (options, callback) => {
+    calls.push(options);
+    const req = new EventEmitter();
+    req.end = () => queueMicrotask(() => {
+      options.lookup(options.hostname, { all: false }, (error, address, family) => {
+        if (error) {
+          req.emit('error', error);
+          return;
+        }
+        pinned.push({ address, family });
+        req.pinnedAddress = address;
+        req.pinnedFamily = family;
+        const response = new PassThrough();
+        response.statusCode = statusCode;
+        response.headers = {
+          'content-type': 'text/plain; charset=utf-8',
+          'content-length': String(body.byteLength),
+          ...headers
+        };
+        callback(response);
+        response.end(body);
+      });
+    });
+    req.destroy = () => { req.destroyed = true; };
+    return req;
+  };
+  return { calls, pinned, request };
+}
+
+function safeDownloader(options = {}) {
+  return createSafeFileDownloader({
+    allowDirectEgress: true, proxyConfigured: () => false, ...options
+  });
 }
 
 function code(expected, outcomeUnknown = false) {
@@ -395,6 +440,557 @@ test('selected Teams, transcript and file sources use only documented GET routes
     '/v1.0/drives/fake-drive/items/fake-item'
   ]);
   assert.ok(h.calls.every(call => call.options.method === 'GET'));
+});
+
+test('selected file content requires per-read approval before acquiring credentials', async () => {
+  const h = harness();
+  await h.connect({ sources: { files: [{ driveId: 'fake-drive', itemId: 'fake-item' }] } });
+  await assert.rejects(h.adapter.connectors.files.readContent({
+    driveId: 'fake-drive', itemId: 'fake-item', approvedHost: 'tenant.sharepoint.com'
+  }), code('file_content_consent_required'));
+  await assert.rejects(h.adapter.connectors.files.readContent({
+    driveId: 'fake-drive', itemId: 'fake-item', approvedHost: 'https://tenant.sharepoint.com',
+    confirmRead: true
+  }), code('invalid_content_host'));
+  assert.equal(h.tokenCalls.length, 1);
+  assert.equal(h.calls.length, 1);
+
+  const disconnected = harness();
+  await assert.rejects(disconnected.adapter.connectors.files.readContent(), code('disconnected'));
+  assert.equal(disconnected.calls.length, 0);
+
+  const unselected = harness();
+  await unselected.connect({ sources: {} });
+  await assert.rejects(unselected.adapter.connectors.files.readContent({
+    driveId: 'fake-drive', itemId: 'fake-item', approvedHost: 'tenant.sharepoint.com',
+    confirmRead: true
+  }), code('source_not_authorized'));
+  assert.equal(unselected.calls.length, 1);
+});
+
+test('direct file egress is disabled by default and configured proxies fail closed', async () => {
+  if (process.platform === 'win32') assert.equal(directFileEgressAllowed(true), false);
+  const h = harness();
+  await h.connect({ sources: { files: [{ driveId: 'fake-drive', itemId: 'fake-item' }] } });
+  await assert.rejects(h.adapter.connectors.files.readContent({
+    driveId: 'fake-drive', itemId: 'fake-item', approvedHost: 'tenant.sharepoint.com',
+    confirmRead: true
+  }), code('network_policy_unavailable'));
+  assert.equal(h.tokenCalls.length, 1);
+  assert.equal(h.calls.length, 1);
+
+  let resolutionCalls = 0;
+  const proxyConfigured = safeDownloader({
+    proxyConfigured: () => true,
+    resolve: async () => { resolutionCalls++; return [{ address: '8.8.8.8', family: 4 }]; },
+    request: () => { throw new Error('Socket must not open'); }
+  });
+  await assert.rejects(proxyConfigured({
+    url: 'https://tenant.sharepoint.com/download', approvedHost: 'tenant.sharepoint.com'
+  }), error => error instanceof SafeFileDownloadError && error.code === 'network_policy_unavailable');
+  assert.equal(resolutionCalls, 0);
+});
+
+test('proxy detection covers proxy environment variable variants without mutating process state', async () => {
+  for (const name of [
+    'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy',
+    'npm_config_https_proxy', 'NPM_CONFIG_HTTPS_PROXY',
+    'npm_config_http_proxy', 'NPM_CONFIG_HTTP_PROXY',
+    'npm_config_proxy', 'NPM_CONFIG_PROXY',
+    'GLOBAL_AGENT_HTTP_PROXY', 'GLOBAL_AGENT_HTTPS_PROXY'
+  ]) {
+    const configured = environmentProxyConfigured({
+      env: { [name]: 'http://proxy.invalid:8080' }, platform: 'linux', execArgv: []
+    });
+    assert.equal(configured, true, `${name} must be recognized`);
+    assert.equal(directFileEgressAllowed(true, () => configured), false,
+      `${name} must close the direct-egress path`);
+  }
+  assert.equal(environmentProxyConfigured({ env: {}, platform: 'linux', execArgv: [] }), false);
+  assert.equal(environmentProxyConfigured({ env: {}, platform: 'win32', execArgv: [] }), true);
+
+  for (const nodeOptions of [
+    '--use-env-proxy=true',
+    '--use-env-proxy=1',
+    '"--use-env-proxy"',
+    "'--use-env-proxy=true'",
+    '--trace-warnings "--use-env-proxy=1"'
+  ]) {
+    let resolutionCalls = 0;
+    let socketCalls = 0;
+    const download = safeDownloader({
+      proxyConfigured: () => environmentProxyConfigured({
+        env: { NODE_OPTIONS: nodeOptions }, platform: 'linux', execArgv: []
+      }),
+      resolve: async () => { resolutionCalls++; return [{ address: '8.8.8.8', family: 4 }]; },
+      request: () => { socketCalls++; throw new Error('Socket must not open'); }
+    });
+    await assert.rejects(download({
+      url: 'https://tenant.sharepoint.com/download', approvedHost: 'tenant.sharepoint.com'
+    }), error => error instanceof SafeFileDownloadError && error.code === 'network_policy_unavailable');
+    assert.equal(resolutionCalls, 0, `${nodeOptions} must fail before DNS`);
+    assert.equal(socketCalls, 0, `${nodeOptions} must fail before opening a socket`);
+  }
+});
+
+test('file metadata never exposes signed URLs and content still requires per-read approval', async () => {
+  const signedUrl = 'https://169.254.169.254/latest/meta-data?secret=fake-signed-url';
+  const h = harness({
+    handle: async url => {
+      if (url.pathname.endsWith('/items/fake-item')) {
+        return Response.json({
+          id: 'fake-item', name: 'Fake notes.txt', size: 12,
+          file: { mimeType: 'text/plain' },
+          '@microsoft.graph.downloadUrl': signedUrl
+        });
+      }
+      return new Response(null, { status: 302, headers: { Location: signedUrl } });
+    }
+  });
+  await h.connect({ sources: { files: [{ driveId: 'fake-drive', itemId: 'fake-item' }] } });
+  const metadata = await h.adapter.connectors.files.read();
+  assert.equal(metadata.items[0].contentAvailable, false);
+  assert.equal(Object.hasOwn(metadata.items[0], 'content'), false);
+  assert.doesNotMatch(JSON.stringify(metadata), /169\.254|fake-signed-url|downloadUrl/i);
+  assert.deepEqual(h.calls.map(call => call.url.pathname), [
+    '/v1.0/me', '/v1.0/me', '/v1.0/drives/fake-drive/items/fake-item'
+  ]);
+  assert.ok(h.calls.every(call => call.url.origin === 'https://graph.microsoft.com' &&
+    call.options.redirect === 'error' &&
+    call.options.headers.Authorization === 'Bearer synthetic.bearer.only'));
+
+  await assert.rejects(h.adapter.connectors.files.readContent({
+    driveId: 'fake-drive', itemId: 'fake-item', approvedHost: 'tenant.sharepoint.com'
+  }), code('file_content_consent_required'));
+  assert.deepEqual(h.calls.map(call => call.url.origin), Array(3).fill('https://graph.microsoft.com'));
+});
+
+test('a Graph metadata redirect fails closed and never reaches the destination', async () => {
+  const signedUrl = 'https://files.attacker.invalid/fake-signed-url';
+  const h = harness({ handle: async () => new Response(null, {
+    status: 302, headers: { Location: signedUrl }
+  }) });
+  await h.connect({ sources: { files: [{ driveId: 'fake-drive', itemId: 'fake-item' }] } });
+  await assert.rejects(
+    h.adapter.connectors.files.read(),
+    code('service_error')
+  );
+  assert.deepEqual(h.calls.map(call => call.url.origin), [
+    'https://graph.microsoft.com', 'https://graph.microsoft.com', 'https://graph.microsoft.com'
+  ]);
+  assert.ok(h.calls.every(call => call.options.headers.Authorization === 'Bearer synthetic.bearer.only'));
+  assert.doesNotMatch(JSON.stringify(h.adapter.status()), /attacker\.invalid|fake-signed-url/);
+});
+
+test('pinned text download uses only the validated public IPv4 and credentialless verified HTTPS', async () => {
+  const answers = [{ address: '8.8.8.8', family: 4 }];
+  const requests = mockedHttps({ body: Buffer.from('Synthetic plain text') });
+  let resolutionCount = 0;
+  const download = safeDownloader({
+    resolve: async hostname => {
+      assert.equal(hostname, 'tenant.sharepoint.com');
+      resolutionCount++;
+      return answers;
+    },
+    request: (options, callback) => {
+      answers[0].address = '169.254.169.254';
+      return requests.request(options, callback);
+    }
+  });
+  const text = await download({
+    url: 'https://tenant.sharepoint.com/download?sig=synthetic-secret',
+    approvedHost: 'tenant.sharepoint.com'
+  });
+  assert.equal(text, 'Synthetic plain text');
+  assert.equal(resolutionCount, 1);
+  assert.deepEqual(requests.pinned, [{ address: '8.8.8.8', family: 4 }]);
+  const [options] = requests.calls;
+  assert.equal(options.hostname, 'tenant.sharepoint.com');
+  assert.equal(options.servername, 'tenant.sharepoint.com');
+  assert.equal(options.port, 443);
+  assert.equal(options.rejectUnauthorized, true);
+  assert.equal(options.agent, false);
+  assert.deepEqual(options.headers, { Accept: 'text/plain', 'Accept-Encoding': 'identity' });
+  assert.equal(Object.hasOwn(options.headers, 'Authorization'), false);
+  assert.equal(Object.hasOwn(options.headers, 'Cookie'), false);
+  const mismatchedLookup = await new Promise(resolve => {
+    options.lookup('attacker.sharepoint.com', {}, error => resolve(error));
+  });
+  assert.ok(mismatchedLookup instanceof Error);
+  const allAddresses = await new Promise((resolve, reject) => {
+    options.lookup(options.hostname, { all: true }, (error, addresses) =>
+      error ? reject(error) : resolve(addresses));
+  });
+  assert.deepEqual(allAddresses, [{ address: '8.8.8.8', family: 4 }]);
+  const callbackOverload = await new Promise((resolve, reject) => {
+    options.lookup(options.hostname, (error, address, family) =>
+      error ? reject(error) : resolve({ address, family }));
+  });
+  assert.deepEqual(callbackOverload, { address: '8.8.8.8', family: 4 });
+});
+
+test('file download rejects private, reserved and mixed DNS answers before opening a socket', async () => {
+  const blockedAddresses = [
+    '0.1.2.3', '10.1.2.3', '100.64.0.1', '127.0.0.1', '169.254.1.2',
+    '172.16.0.1', '192.0.0.1', '192.0.2.1', '192.88.99.1', '192.168.1.1',
+    '198.18.0.1', '198.51.100.1', '203.0.113.1', '224.0.0.1', '240.0.0.1'
+  ];
+  for (const address of blockedAddresses) {
+    let socketCalls = 0;
+    const download = safeDownloader({
+      resolve: async () => [{ address, family: 4 }],
+      request: () => { socketCalls++; throw new Error('Socket must not open'); }
+    });
+    await assert.rejects(download({
+      url: 'https://tenant.sharepoint.com/download?sig=synthetic-secret',
+      approvedHost: 'tenant.sharepoint.com'
+    }), error => error instanceof SafeFileDownloadError && error.code === 'blocked_request');
+    assert.equal(socketCalls, 0);
+  }
+  let mixedSocketCalls = 0;
+  const mixed = safeDownloader({
+    resolve: async () => [
+      { address: '8.8.8.8', family: 4 }, { address: '10.0.0.1', family: 4 }
+    ],
+    request: () => { mixedSocketCalls++; throw new Error('Socket must not open'); }
+  });
+  await assert.rejects(mixed({
+    url: 'https://tenant.sharepoint.com/download',
+    approvedHost: 'tenant.sharepoint.com'
+  }), error => error instanceof SafeFileDownloadError && error.code === 'blocked_request');
+  assert.equal(mixedSocketCalls, 0);
+});
+
+test('file download rejects unsafe origins, explicit ports, IP literals and redirects', async () => {
+  let resolutions = 0;
+  const download = safeDownloader({
+    resolve: async () => { resolutions++; return [{ address: '8.8.8.8', family: 4 }]; },
+    request: mockedHttps({ statusCode: 302 }).request
+  });
+  for (const url of [
+    'http://tenant.sharepoint.com/download',
+    'https://tenant.sharepoint.com:443/download',
+    'https://user@tenant.sharepoint.com/download',
+    'https://169.254.169.254/latest/meta-data',
+    'https://other.sharepoint.com/download',
+    'https://tenant.sharepoint.com/a/%2e%2e/private',
+    'https://tenant.sharepoint.com/a/%252e%252e/private',
+    'https://tenant.sharepoint.com/a/%252fprivate',
+    'https://tenant.sharepoint.com/download#fragment'
+  ]) {
+    await assert.rejects(download({ url, approvedHost: 'tenant.sharepoint.com' }),
+      error => error instanceof SafeFileDownloadError && error.code === 'blocked_request');
+  }
+  assert.equal(resolutions, 0);
+  const redirectResponse = mockedHttps({
+    statusCode: 302, headers: { location: 'https://other.sharepoint.com/next' }
+  });
+  const redirect = safeDownloader({
+    resolve: async () => [{ address: '8.8.8.8', family: 4 }],
+    request: redirectResponse.request
+  });
+  await assert.rejects(redirect({
+    url: 'https://tenant.sharepoint.com/download',
+    approvedHost: 'tenant.sharepoint.com'
+  }), error => error instanceof SafeFileDownloadError && error.code === 'blocked_request');
+  assert.equal(redirectResponse.calls.length, 1);
+});
+
+test('TLS failures are sanitized and never retried or returned with the signed URL', async () => {
+  const signedUrl = 'https://tenant.sharepoint.com/download?sig=private-synthetic';
+  let requestCalls = 0;
+  const request = () => {
+    requestCalls++;
+    const req = new EventEmitter();
+    req.end = () => queueMicrotask(() => req.emit('error', new Error(`bad certificate for ${signedUrl}`)));
+    req.destroy = () => { req.destroyed = true; };
+    return req;
+  };
+  const download = safeDownloader({
+    resolve: async () => [{ address: '8.8.8.8', family: 4 }], request
+  });
+  await assert.rejects(download({ url: signedUrl, approvedHost: 'tenant.sharepoint.com' }), error => {
+    assert.ok(error instanceof SafeFileDownloadError);
+    assert.equal(error.code, 'transport_error');
+    assert.doesNotMatch(JSON.stringify(error) + error.stack, /private-synthetic|bad certificate/i);
+    return true;
+  });
+  assert.equal(requestCalls, 1);
+});
+
+test('file download bounds bytes and rejects compressed or invalid UTF-8 responses', async () => {
+  const oversized = mockedHttps({ body: Buffer.alloc(MAX_FILE_CONTENT_BYTES + 1, 65) });
+  const largeDownload = safeDownloader({
+    resolve: async () => [{ address: '8.8.8.8', family: 4 }], request: oversized.request
+  });
+  await assert.rejects(largeDownload({
+    url: 'https://tenant.sharepoint.com/download',
+    approvedHost: 'tenant.sharepoint.com'
+  }), error => error instanceof SafeFileDownloadError && error.code === 'response_too_large');
+
+  for (const headers of [
+    { 'content-encoding': 'gzip' },
+    { 'content-type': 'application/pdf' },
+    { 'content-type': 'text/plain; charset=utf-16' },
+    { 'content-length': String(MAX_FILE_CONTENT_BYTES + 1) }
+  ]) {
+    const response = mockedHttps({ headers });
+    const download = safeDownloader({
+      resolve: async () => [{ address: '8.8.8.8', family: 4 }], request: response.request
+    });
+    await assert.rejects(download({
+      url: 'https://tenant.sharepoint.com/download',
+      approvedHost: 'tenant.sharepoint.com'
+    }), error => error instanceof SafeFileDownloadError &&
+      error.code === (headers['content-length'] ? 'response_too_large' : 'file_content_unavailable'));
+  }
+
+  const noCharset = mockedHttps({
+    body: Buffer.from('Plain UTF-8 without a charset.'), headers: { 'content-type': 'text/plain' }
+  });
+  const noCharsetDownload = safeDownloader({
+    resolve: async () => [{ address: '8.8.8.8', family: 4 }], request: noCharset.request
+  });
+  assert.equal(await noCharsetDownload({
+    url: 'https://tenant.sharepoint.com/download', approvedHost: 'tenant.sharepoint.com'
+  }), 'Plain UTF-8 without a charset.');
+
+  const invalid = mockedHttps({ body: Buffer.from([0xc3, 0x28]) });
+  const invalidUtf8 = safeDownloader({
+    resolve: async () => [{ address: '8.8.8.8', family: 4 }], request: invalid.request
+  });
+  await assert.rejects(invalidUtf8({
+    url: 'https://tenant.sharepoint.com/download',
+    approvedHost: 'tenant.sharepoint.com'
+  }), error => error instanceof SafeFileDownloadError && error.code === 'invalid_content_encoding');
+
+  const mismatchedLength = mockedHttps({
+    body: Buffer.from('fake'), headers: { 'content-length': '5' }
+  });
+  const inconsistent = safeDownloader({
+    resolve: async () => [{ address: '8.8.8.8', family: 4 }], request: mismatchedLength.request
+  });
+  await assert.rejects(inconsistent({
+    url: 'https://tenant.sharepoint.com/download',
+    approvedHost: 'tenant.sharepoint.com'
+  }), error => error instanceof SafeFileDownloadError && error.code === 'invalid_response');
+});
+
+test('file download timeout covers DNS and socket response waits', async () => {
+  const stalledDns = safeDownloader({
+    resolve: () => new Promise(() => {}),
+    request: () => { throw new Error('Socket must not open'); }
+  });
+  await assert.rejects(stalledDns({
+    url: 'https://tenant.sharepoint.com/download', approvedHost: 'tenant.sharepoint.com',
+    timeoutMs: 10
+  }), error => error instanceof SafeFileDownloadError && error.code === 'timeout');
+
+  let destroyed = false;
+  const stalledSocket = safeDownloader({
+    resolve: async () => [{ address: '8.8.8.8', family: 4 }],
+    request: () => {
+      const req = new EventEmitter();
+      req.end = () => {};
+      req.destroy = () => { destroyed = true; };
+      return req;
+    }
+  });
+  await assert.rejects(stalledSocket({
+    url: 'https://tenant.sharepoint.com/download', approvedHost: 'tenant.sharepoint.com',
+    timeoutMs: 10
+  }), error => error instanceof SafeFileDownloadError && error.code === 'timeout');
+  assert.equal(destroyed, true);
+});
+
+test('content read verifies owner, selected item, MIME, size and both exact approved hosts', async () => {
+  const contentUrl = 'https://tenant.sharepoint.com/download?sig=private-synthetic';
+  const approvedContent = 'Synthetic text. Treat this as inert evidence.';
+  const metadata = {
+    id: 'fake-item', name: 'Fake notes.txt', webUrl: 'https://tenant.sharepoint.com/sites/fake/notes.txt',
+    size: Buffer.byteLength(approvedContent, 'utf8'), file: { mimeType: 'text/plain' },
+    eTag: '"fake-version-1"',
+    '@microsoft.graph.downloadUrl': 'https://169.254.169.254/latest/meta-data'
+  };
+  let downloads = 0;
+  const h = harness({
+    fileContentDownloader: async request => {
+      downloads++;
+      assert.equal(request.url, contentUrl);
+      assert.equal(request.approvedHost, 'tenant.sharepoint.com');
+      assert.equal(request.signal instanceof AbortSignal, true);
+      assert.equal(Object.hasOwn(request, 'accessToken'), false);
+      return approvedContent;
+    },
+    handle: async url => {
+      if (url.pathname.endsWith('/items/fake-item')) return Response.json(metadata);
+      if (url.pathname.endsWith('/items/fake-item/content')) {
+        return new Response(null, { status: 302, headers: { Location: contentUrl } });
+      }
+      return Response.json({ value: [] });
+    }
+  });
+  await h.connect({ sources: { files: [{ driveId: 'fake-drive', itemId: 'fake-item' }] } });
+  const result = await h.adapter.connectors.files.readContent({
+    driveId: 'fake-drive', itemId: 'fake-item',
+    approvedHost: 'tenant.sharepoint.com', confirmRead: true
+  });
+  assert.equal(result.verifiedOwner, true);
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].contentAvailable, true);
+  assert.equal(result.items[0].content, approvedContent);
+  assert.equal(result.items[0].trust, 'untrusted-evidence');
+  assert.equal(result.items[0].provenance, 'explicit-owner-approved-sharepoint-read');
+  assert.equal(result.items[0].eTag, metadata.eTag);
+  assert.doesNotMatch(JSON.stringify(result), /private-synthetic|169\.254|synthetic\.bearer\.only/);
+  assert.equal(downloads, 1);
+  const graphCalls = h.calls.filter(call => call.url.hostname === 'graph.microsoft.com');
+  assert.ok(graphCalls.every(call => call.options.headers.Authorization === 'Bearer synthetic.bearer.only'));
+  const redirectCall = graphCalls.find(call => call.url.pathname.endsWith('/content'));
+  assert.equal(redirectCall.options.method, 'GET');
+  assert.equal(redirectCall.options.redirect, 'manual');
+  assert.equal(h.tokenCalls[1].scopes.includes('Files.Read'), true);
+});
+
+test('content evidence requires a valid unchanged Graph eTag before and after download', async () => {
+  const content = 'Synthetic revision-bound text.';
+  const baseMetadata = {
+    id: 'fake-item', name: 'Fake notes.txt',
+    webUrl: 'https://tenant.sharepoint.com/sites/fake/notes.txt',
+    size: Buffer.byteLength(content, 'utf8'), file: { mimeType: 'text/plain' }
+  };
+  for (const scenario of [
+    { before: { ...baseMetadata }, after: { ...baseMetadata, eTag: '"v1"' },
+      expected: 'file_revision_unavailable', expectedMetadataReads: 1, expectedDownloads: 0 },
+    { before: { ...baseMetadata, eTag: '"v1"' }, after: { ...baseMetadata },
+      expected: 'file_revision_unavailable', expectedMetadataReads: 2, expectedDownloads: 1 },
+    { before: { ...baseMetadata, eTag: '"v1"' }, after: { ...baseMetadata, eTag: '"v2"' },
+      expected: 'file_revision_changed', expectedMetadataReads: 2, expectedDownloads: 1 },
+    { before: { ...baseMetadata, eTag: '"v1"' }, after: { ...baseMetadata, eTag: '"v1"', size: 2 },
+      expected: 'file_revision_changed', expectedMetadataReads: 2, expectedDownloads: 1 }
+  ]) {
+    let metadataReads = 0;
+    let downloads = 0;
+    const h = harness({
+      fileContentDownloader: async () => { downloads++; return content; },
+      handle: async url => {
+        if (url.pathname.endsWith('/items/fake-item')) {
+          metadataReads++;
+          return Response.json(metadataReads === 1 ? scenario.before : scenario.after);
+        }
+        if (url.pathname.endsWith('/content')) {
+          return new Response(null, {
+            status: 302, headers: { Location: 'https://tenant.sharepoint.com/signed' }
+          });
+        }
+        return Response.json({ value: [] });
+      }
+    });
+    await h.connect({ sources: { files: [{ driveId: 'fake-drive', itemId: 'fake-item' }] } });
+    await assert.rejects(h.adapter.connectors.files.readContent({
+      driveId: 'fake-drive', itemId: 'fake-item',
+      approvedHost: 'tenant.sharepoint.com', confirmRead: true
+    }), code(scenario.expected));
+    assert.equal(metadataReads, scenario.expectedMetadataReads);
+    assert.equal(downloads, scenario.expectedDownloads);
+  }
+});
+
+test('file content host mismatch, unsupported format, and oversized metadata fail before download', async () => {
+  const baseMetadata = {
+    id: 'fake-item', name: 'Fake notes.txt',
+    webUrl: 'https://tenant.sharepoint.com/sites/fake/notes.txt',
+    size: 12, file: { mimeType: 'text/plain' }, eTag: '"fake-version"'
+  };
+  for (const { metadata, location, expected } of [
+    { metadata: { ...baseMetadata, webUrl: 'https://other.sharepoint.com/fake.txt' },
+      location: 'https://tenant.sharepoint.com/signed', expected: 'blocked_request' },
+    { metadata: baseMetadata, location: 'https://other.sharepoint.com/signed', expected: 'blocked_request' },
+    { metadata: { ...baseMetadata, file: { mimeType: 'application/pdf' } },
+      location: 'https://tenant.sharepoint.com/signed', expected: 'file_content_unavailable' },
+    { metadata: { ...baseMetadata, remoteItem: { id: 'foreign-shortcut' } },
+      location: 'https://tenant.sharepoint.com/signed', expected: 'file_content_unavailable' },
+    { metadata: { ...baseMetadata, size: MAX_FILE_CONTENT_BYTES + 1 },
+      location: 'https://tenant.sharepoint.com/signed', expected: 'response_too_large' }
+  ]) {
+    let downloads = 0;
+    const h = harness({
+      fileContentDownloader: async () => { downloads++; return 'not read'; },
+      handle: async url => {
+        if (url.pathname.endsWith('/items/fake-item')) return Response.json(metadata);
+        if (url.pathname.endsWith('/content')) {
+          return new Response(null, { status: 302, headers: { Location: location } });
+        }
+        return Response.json({ value: [] });
+      }
+    });
+    await h.connect({ sources: { files: [{ driveId: 'fake-drive', itemId: 'fake-item' }] } });
+    await assert.rejects(h.adapter.connectors.files.readContent({
+      driveId: 'fake-drive', itemId: 'fake-item',
+      approvedHost: 'tenant.sharepoint.com', confirmRead: true
+    }), code(expected));
+    assert.equal(downloads, 0);
+    assert.doesNotMatch(JSON.stringify(h.adapter.status()), /other\.sharepoint\.com|signed/);
+  }
+});
+
+test('custom downloader errors cannot leak signed URLs or arbitrary error codes', async () => {
+  const signedUrl = 'https://tenant.sharepoint.com/download?sig=private-synthetic';
+  const h = harness({
+    fileContentDownloader: async () => {
+      throw new SafeFileDownloadError(`private-synthetic:${signedUrl}`);
+    },
+    handle: async url => {
+      if (url.pathname.endsWith('/items/fake-item')) {
+        return Response.json({
+          id: 'fake-item', name: 'Fake notes.txt',
+          webUrl: 'https://tenant.sharepoint.com/sites/fake/notes.txt',
+          size: 12, eTag: '"fake-version"',
+          file: { mimeType: 'text/plain' }
+        });
+      }
+      if (url.pathname.endsWith('/content')) {
+        return new Response(null, { status: 302, headers: { Location: signedUrl } });
+      }
+      return Response.json({ value: [] });
+    }
+  });
+  await h.connect({ sources: { files: [{ driveId: 'fake-drive', itemId: 'fake-item' }] } });
+  await assert.rejects(h.adapter.connectors.files.readContent({
+    driveId: 'fake-drive', itemId: 'fake-item',
+    approvedHost: 'tenant.sharepoint.com', confirmRead: true
+  }), error => {
+    assert.ok(error instanceof ConnectorError);
+    assert.equal(error.code, 'transport_error');
+    assert.doesNotMatch(JSON.stringify(error) + error.stack, /private-synthetic|tenant\.sharepoint\.com\/download/);
+    return true;
+  });
+});
+
+test('downloaded UTF-8 byte length must still match selected Graph metadata', async () => {
+  const signedUrl = 'https://tenant.sharepoint.com/download?sig=private-synthetic';
+  const h = harness({
+    fileContentDownloader: async () => 'different-sized content',
+    handle: async url => {
+      if (url.pathname.endsWith('/items/fake-item')) {
+        return Response.json({
+          id: 'fake-item', name: 'Fake notes.txt',
+          webUrl: 'https://tenant.sharepoint.com/sites/fake/notes.txt',
+          size: 12, eTag: '"fake-version"',
+          file: { mimeType: 'text/plain' }
+        });
+      }
+      if (url.pathname.endsWith('/content')) {
+        return new Response(null, { status: 302, headers: { Location: signedUrl } });
+      }
+      return Response.json({ value: [] });
+    }
+  });
+  await h.connect({ sources: { files: [{ driveId: 'fake-drive', itemId: 'fake-item' }] } });
+  await assert.rejects(h.adapter.connectors.files.readContent({
+    driveId: 'fake-drive', itemId: 'fake-item',
+    approvedHost: 'tenant.sharepoint.com', confirmRead: true
+  }), code('invalid_response'));
 });
 
 test('denied selected sources yield explicit gaps instead of fictitious complete coverage', async () => {

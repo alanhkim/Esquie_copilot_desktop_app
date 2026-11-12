@@ -47,6 +47,10 @@ test('binds only to loopback and serves a hardened fresh-install shell', async t
   assert.equal(page.status, 200);
   assert.match(page.headers.get('content-security-policy'), /frame-ancestors 'none'/);
   assert.match(await page.text(), /Your local workspace/);
+  const module = await fetch(`${baseUrl}/task-board.mjs`);
+  assert.equal(module.status, 200);
+  assert.match(module.headers.get('content-type'), /text\/javascript/);
+  assert.match(await module.text(), /export function matchingTasks/);
 });
 
 test('persists task and draft state across a server restart', async t => {
