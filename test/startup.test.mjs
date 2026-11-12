@@ -46,7 +46,7 @@ test('post-bind initialization failure closes its reserved listener and releases
   await new Promise(resolve => probe.close(resolve));
   const path = join(root, 'esquie-launch.html');
   await writeFile(path, 'Fake unrelated owner file.', { mode: 0o600 });
-  await assert.rejects(startServer({ dataDir: root, port, workerIntervalMs: 0 }), /unrelated launch file/);
+  await assert.rejects(startServer({ dataDir: root, port, workerIntervalMs: 0 }), /ownership is not established/);
   assert.equal(await readFile(path, 'utf8'), 'Fake unrelated owner file.');
   await assert.rejects(lstat(join(root, 'workspace.lock')), { code: 'ENOENT' });
   await rm(path);

@@ -3,12 +3,17 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { newWorkspace } from '../src/store.mjs';
+import { adoptLegacyWorkspace, newWorkspace } from '../src/store.mjs';
 import { startServer } from '../src/server.mjs';
 
 async function setup(t, legacy) {
   const root = await mkdtemp(join(tmpdir(), 'esquie-onboarding-'));
-  if (legacy) await writeFile(join(root, 'workspace.json'), JSON.stringify(legacy), { mode: 0o600 });
+  if (legacy) {
+    const source = await mkdtemp(join(tmpdir(), 'esquie-onboarding-legacy-'));
+    t.after(() => rm(source, { force: true, recursive: true }));
+    await writeFile(join(source, 'workspace.json'), JSON.stringify(legacy), { mode: 0o600 });
+    await adoptLegacyWorkspace({ source, destination: root, confirmed: true });
+  }
   let tokenCalls = 0;
   const options = { dataDir: root, port: 0, workerIntervalMs: 0, microsoft365Options: { tokenProvider: async () => { tokenCalls++; throw new Error('Fake provider must never be reached by setup.'); } } };
   let app = await startServer(options);
@@ -59,7 +64,7 @@ test('fresh setup is resumable/skippable, preserves saved steps and does not inf
   assert.equal((await context.state()).onboarding.step, 0);
 });
 
-test('returning users retain existing settings/data and legacy setup never invents completion or resets preferences', async t => {
+test('adopted setup preserves profile data without inventing completion or restoring scheduling', async t => {
   const legacy = newWorkspace();
   delete legacy.onboarding;
   legacy.profile = { displayName: 'Fake returning owner', timezone: 'UTC', writingStyle: 'Keep existing style.' };
@@ -75,7 +80,7 @@ test('returning users retain existing settings/data and legacy setup never inven
   await context.change('complete', { confirmReview: true });
   state = await context.state();
   assert.equal(state.preferences.paused, true);
-  assert.equal(state.preferences.automaticRefresh, true);
+  assert.equal(state.preferences.automaticRefresh, false);
   assert.equal(state.profile.timezone, 'UTC');
   assert.equal(state.profile.writingStyle, 'Keep existing style.');
 });

@@ -56,6 +56,10 @@ Windows sign-in startup is **off by default** and can be enabled explicitly in
 the application or tray menu for an installed build. It is unavailable in dev mode.
 The synthetic smoke uses a fake server to verify protected launch and reload;
 the ordinary smoke exercises the integrated backend in a temporary workspace.
+`npm test` also checks the literal backend/public resource allowlist and starts
+only those copied runtime files with disposable data and port zero, using Node
+without Electron/build artifacts. Missing imported runtime modules fail this
+check; it does not replace a real policy-compliant package/install validation.
 
 ## Integration and limitations
 

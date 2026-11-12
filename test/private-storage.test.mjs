@@ -20,12 +20,12 @@ test('a fresh app directory is current-user protected and can restart without pe
 test('shared existing directories and state files are rejected without rewriting their permissions', async t => {
   const parent = await mkdtemp(join(tmpdir(), 'esquie-private-existing-'));
   t.after(() => rm(parent, { force: true, recursive: true }));
-  for (const target of ['directory', 'file']) {
+  for (const target of ['directory', 'file', 'journal']) {
     const root = join(parent, target);
     await mkdir(root, { mode: 0o700 });
     await assertPrivateStorage(root, { created: true });
-    const path = target === 'directory' ? root : join(root, 'workspace.json');
-    if (target === 'file') await writeFile(path, '{"fake":true}', { mode: 0o600 });
+    const path = target === 'directory' ? root : join(root, target === 'journal' ? 'workspace.sqlite-journal' : 'workspace.json');
+    if (target !== 'directory') await writeFile(path, '{"fake":true}', { mode: 0o600 });
     if (process.platform === 'win32') {
       const { stdout: before } = await runSystemPowerShell(`
 $ErrorActionPreference = 'Stop'

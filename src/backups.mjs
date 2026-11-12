@@ -3,7 +3,7 @@ import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { assertPlainLocalFile } from './local-output.mjs';
-import { openStore } from './store.mjs';
+import { openRecoveredSnapshot } from './store.mjs';
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 
@@ -57,7 +57,7 @@ export async function recoverLocalBackup({ root, backup, now, verifyOutput }) {
   const destination = join(root, 'recoveries', id);
   await localDirectory(destination, { exclusive: true });
   await copyFile(path, join(destination, 'workspace.sqlite'), constants.COPYFILE_EXCL);
-  const recovered = await openStore(destination);
+  const recovered = await openRecoveredSnapshot(destination);
   try {
     recovered.update(state => {
       Object.assign(state.preferences, { paused: true, automaticRefresh: false, dailyBackups: false, localOutputApproved: false, demoApproved: false });

@@ -16,7 +16,7 @@ const builder = require.resolve('electron-builder/out/cli/cli.js');
 const electron = dirname(require.resolve('electron/package.json'));
 const electronDist = join(electron, 'dist');
 const expected = [
-  'src/server.mjs', 'src/store.mjs', 'src/worker.mjs', 'src/backups.mjs',
+  'src/server.mjs', 'src/store.mjs', 'src/worker.mjs', 'src/backups.mjs', 'src/monthly-outcomes-import.mjs',
   'src/local-output.mjs', 'src/private-storage.mjs', 'src/assistant/bridge.mjs',
   'src/connectors/microsoft365.mjs', 'public/index.html', 'public/styles.css', 'public/app.js'
 ];

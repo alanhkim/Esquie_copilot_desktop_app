@@ -320,6 +320,42 @@ Do not weaken Conditional Access or imply the flow was verified. Obtain an
 approved, maintained validation implementation and complete adversarial synthetic
 tests and security review before a separately authorized live tenant validation.
 
+### Azure CLI alternative
+
+The official [Azure CLI token command](https://learn.microsoft.com/en-us/cli/azure/account#az-account-get-access-token)
+accepts Graph resource scopes and a tenant or subscription, but it does not
+provide a user-object selector or report granted scopes in its documented
+output. Its `tokenType: Bearer` does not distinguish delegated from
+application credentials. The public development implementation
+[constructs that output](https://github.com/Azure/azure-cli/blob/dev/src/azure-cli/azure/cli/command_modules/profile/custom.py)
+without granted scopes or authenticated object ID. This is evidence about the
+public development version, not a verification of the locally installed version.
+The [documented token example](https://learn.microsoft.com/en-us/cli/azure/authenticate-azure-cli-interactively#refresh-tokens)
+likewise contains neither. Requested scopes cannot honestly be returned as
+granted scopes merely because the command succeeded. Microsoft directs clients
+to treat [Graph access tokens as opaque](https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens);
+decoding an access token is not a supported replacement for the missing metadata.
+
+The CLI can represent a user, service principal, or managed identity; tenant and
+subscription selection alone do not prove which user authorized the token.
+The connector's same-token `/me` check verifies the user object ID, but does not
+establish the tenant assertion or granted scopes. A separate account lookup can
+also race a change of active account and does not bind that lookup to the token.
+The CLI's [development implementation](https://github.com/Azure/azure-cli/blob/dev/src/azure-cli-core/azure/cli/core/_profile.py)
+selects an account through the subscription and rejects supplying both tenant
+and subscription; its `Bearer` and tenant output should not be mistaken for
+independently verified claims. The CLI's existing OS-protected Windows cache
+is separate from an app-owned in-memory-only token store, and disconnecting this
+app would not log out or revoke the CLI's account.
+
+Therefore no Azure CLI provider is wired up. An implementation would first need
+a supported way to bind the returned credential to the owner-confirmed user and
+tenant and establish its actual delegated grants, followed by trusted executable
+selection and cancellable, bounded process handling. Keep sources disconnected
+until those guarantees are established; do not broaden to `.default`, infer
+grants, change the CLI's profile, or substitute a service principal. No local
+CLI account, cache, token, or live Graph operation was inspected or used.
+
 For a future integration, an administrator must register a public client in the
 intended organizational tenant, supply its application/client ID and tenant ID,
 and configure the applicable desktop redirect URI (the MSAL system-browser flow

@@ -65,6 +65,8 @@ test('restart rotates owner capability, preserves data, replaces stale private l
 test('unrelated or changed launcher files are preserved and failed cleanup releases the workspace lock', async t => {
   const root = await mkdtemp(join(tmpdir(), 'esquie-owner-preserve-'));
   t.after(() => rm(root, { force: true, recursive: true }));
+  const initial = await startServer({ dataDir: root, port: 0, workerIntervalMs: 0 });
+  await initial.close();
   const launchFile = join(root, 'esquie-launch.html');
   await writeFile(launchFile, 'Fake owner-authored file, not an app launcher.', { mode: 0o600 });
   await assert.rejects(startServer({ dataDir: root, port: 0, workerIntervalMs: 0 }), /unrelated launch file/);

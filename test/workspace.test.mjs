@@ -232,7 +232,7 @@ test('preserves invalid workspace data instead of resetting it', async () => {
   const path = join(dataDir, 'workspace.json');
   const content = '{"schemaVersion":99,"privateMarker":"keep-me"}\n';
   await writeFile(path, content, 'utf8');
-  await assert.rejects(startServer({ dataDir, port: 0 }), /unsupported or invalid format/);
+  await assert.rejects(startServer({ dataDir, port: 0 }), /ownership is not established/);
   assert.equal(await readFile(path, 'utf8'), content);
   await rm(dataDir, { recursive: true, force: true });
 });
@@ -245,7 +245,7 @@ test('malformed saved workspace and lock errors never expose their private conte
     try {
       await writeFile(path, content, { encoding: 'utf8', mode: 0o600 });
       await assert.rejects(startServer({ dataDir, port: 0 }), error => {
-        assert.match(error.message, /invalid JSON; it was left unchanged/);
+        assert.match(error.message, /ownership is not established/);
         assert.equal(error.message.includes(content), false);
         return true;
       });

@@ -3,18 +3,18 @@ import { createServer } from 'node:http';
 import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import { homedir } from 'node:os';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openStore } from './store.mjs';
 import { createWorker, enqueue } from './worker.mjs';
 import { assertOutputAllowed, assertPlainLocalFile, verifyLocalVolume as defaultVerifyLocalVolume } from './local-output.mjs';
 import { createMicrosoft365Connectors, ConnectorError } from './connectors/microsoft365.mjs';
 import { createAssistantBridge } from './assistant/bridge.mjs';
-import { assertPrivateStorage } from './private-storage.mjs';
+import { assertPrivateDataDirectory, assertPrivateStorage } from './private-storage.mjs';
 import { recoverLocalBackup } from './backups.mjs';
+import { confirmMonthlyOutcomeImport, previewMonthlyOutcomeImport } from './monthly-outcomes-import.mjs';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
-const APP_ROOT = resolve(PUBLIC_DIR, '..');
 const PUBLIC_FILES = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/index.html', ['index.html', 'text/html; charset=utf-8']],
@@ -23,6 +23,7 @@ const PUBLIC_FILES = new Map([
 ]);
 const TASK_STATUSES = new Set(['next', 'doing', 'waiting', 'done']);
 const MAX_BODY_BYTES = 20_000;
+const MAX_OUTCOMES_IMPORT_BODY_BYTES = 128_000;
 const MAX_ACTIVITY_ITEMS = 100;
 
 function privateLauncherContent(launchUrl) {
@@ -56,37 +57,6 @@ class HttpError extends Error {
   }
 }
 
-function pathContains(parent, child) {
-  const rel = relative(parent, child);
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
-}
-
-function assertPrivateDataDirectory(path) {
-  const candidate = resolve(path);
-  let customSyncRoots;
-  try { customSyncRoots = JSON.parse(process.env.ESQUIE_SYNC_ROOTS || '[]'); }
-  catch { throw new Error('ESQUIE_SYNC_ROOTS must be a JSON array of absolute local paths.'); }
-  if (!Array.isArray(customSyncRoots) || customSyncRoots.some(value => typeof value !== 'string' || !isAbsolute(value))) {
-    throw new Error('ESQUIE_SYNC_ROOTS must be a JSON array of absolute local paths.');
-  }
-  const syncRoots = [
-    process.env.OneDrive,
-    process.env.OneDriveCommercial,
-    process.env.OneDriveConsumer,
-    process.env.Dropbox,
-    process.env.GOOGLE_DRIVE,
-    process.env.ICLOUD_DRIVE,
-    ...customSyncRoots
-  ].filter(Boolean).map(path => resolve(path));
-  if (pathContains(APP_ROOT, candidate) ||
-      /^\\\\/.test(candidate) ||
-      syncRoots.some(syncRoot => pathContains(syncRoot, candidate)) ||
-      /(?:^|[\\/])(?:onedrive(?:\s+-\s+[^\\/]+)?|sharepoint|dropbox(?:\s+\([^\\/]+\))?|google[\s-]?drive|my drive|icloud(?:drive)?|box(?: sync| drive)?|nextcloud|syncthing)(?:[\\/]|$)/i.test(candidate)) {
-    throw new Error('Choose a local data directory outside the application repository and cloud-synced folders.');
-  }
-  return candidate;
-}
-
 function isLoopbackAddress(address) {
   if (!address) return false;
   const normalized = address.toLowerCase().replace(/^::ffff:/, '');
@@ -100,6 +70,16 @@ function safeText(value, label, maxLength, { required = false } = {}) {
   if (required && !cleaned) throw new HttpError(400, `${label} is required.`);
   if (cleaned.length > maxLength) throw new HttpError(400, `${label} is too long.`);
   return cleaned;
+}
+
+function outcomesImportCall(action) {
+  try { return action(); }
+  catch (error) {
+    if (Number.isInteger(error?.status) && error.status >= 400 && error.status < 500) {
+      throw new HttpError(error.status, error.message);
+    }
+    throw error;
+  }
 }
 
 function assertOnlyKeys(body, allowed, message) {
@@ -117,6 +97,20 @@ function safeDate(value) {
   const date = new Date(`${value}T00:00:00.000Z`);
   if (!Number.isFinite(date.valueOf()) || date.toISOString().slice(0, 10) !== value) throw new HttpError(400, 'Due date is not a valid calendar date.');
   return value;
+}
+
+function ownerLocalDate(value, timezone) {
+  if (!timezone) return null;
+  let parts;
+  try {
+    parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit'
+    }).formatToParts(value);
+  } catch {
+    throw new HttpError(400, 'The saved owner timezone is invalid. Update it in Operations before importing.');
+  }
+  const date = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${date.year}-${date.month}-${date.day}`;
 }
 
 function safeLinkUrl(value) {
@@ -139,7 +133,7 @@ function jsonResponse(response, status, value, extraHeaders = {}) {
   response.end(JSON.stringify(value));
 }
 
-async function readJson(request) {
+async function readJson(request, maxBytes = MAX_BODY_BYTES) {
   const contentType = String(request.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
   if (contentType !== 'application/json') throw new HttpError(415, 'Send JSON using Content-Type: application/json.');
 
@@ -147,7 +141,7 @@ async function readJson(request) {
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > MAX_BODY_BYTES) throw new HttpError(413, 'Request body is too large.');
+    if (size > maxBytes) throw new HttpError(413, 'Request body is too large.');
     chunks.push(chunk);
   }
   try {
@@ -395,7 +389,8 @@ export async function startServer({
       const documentMatch = /^\/api\/documents\/([0-9a-f-]{36})$/.exec(pathname);
       if (request.method === 'GET' && documentMatch) {
         if (!state.documents.some(item => item.id === documentMatch[1])) throw new HttpError(404, 'Document not found.');
-        if (state.documents.find(item => item.id === documentMatch[1]).fileUnavailableReason) throw new HttpError(410, 'This state-only backup did not include the local document file. The original was not deleted.');
+        const unavailable = state.documents.find(item => item.id === documentMatch[1]).fileUnavailableReason;
+        if (unavailable) throw new HttpError(410, unavailable);
         const path = join(root, 'documents', `${documentMatch[1]}.md`);
         try { await assertPlainLocalFile(path); }
         catch { throw new HttpError(403, 'Document is missing or redirected; reading was blocked.'); }
@@ -550,6 +545,7 @@ export async function startServer({
         if (body.confirmSeparateWorkspace !== true) throw new HttpError(400, 'Confirm recovery into a separate paused workspace.');
         const backup = state.backups.find(item => item.id === recoveryMatch[1]);
         if (!backup) throw new HttpError(404, 'Saved backup not found.');
+        if (backup.fileUnavailableReason) throw new HttpError(410, backup.fileUnavailableReason);
         let recovery;
         try { recovery = await recoverLocalBackup({ root, backup, now: clock(), verifyOutput }); }
         catch { throw new HttpError(409, 'Private recovery was blocked or failed integrity/storage checks. Original workspace, backups and any pre-existing files were not overwritten. Check output approval and private storage.'); }
@@ -699,6 +695,31 @@ export async function startServer({
           return item;
         });
         jsonResponse(response, 201, { record });
+        return;
+      }
+
+      if (request.method === 'POST' && pathname === '/api/outcomes/import/preview') {
+        const body = await readJson(request, MAX_OUTCOMES_IMPORT_BODY_BYTES);
+        assertOnlyKeys(body, new Set(['text']), 'Only pasted workshop text is accepted.');
+        const preview = outcomesImportCall(() =>
+          previewMonthlyOutcomeImport(state.records, body.text, { today: ownerLocalDate(clock(), state.profile.timezone) }));
+        jsonResponse(response, 200, preview);
+        return;
+      }
+
+      if (request.method === 'POST' && pathname === '/api/outcomes/import/confirm') {
+        const body = await readJson(request, MAX_OUTCOMES_IMPORT_BODY_BYTES);
+        assertOnlyKeys(body, new Set(['text', 'revision', 'textHash', 'reviewed']), 'Only the reviewed workshop preview is accepted.');
+        const result = updateState(next => {
+          const now = clock();
+          const imported = outcomesImportCall(() => confirmMonthlyOutcomeImport(
+            next, body.text, body.revision, body.textHash, body.reviewed, now.toISOString(),
+            { today: ownerLocalDate(now, next.profile.timezone) }
+          ));
+          if (imported.imported) recordActivity(next, 'local-outcomes-import', `Imported ${imported.imported} owner-reviewed workshop outcomes locally.`, now.toISOString());
+          return imported;
+        });
+        jsonResponse(response, 200, result);
         return;
       }
 

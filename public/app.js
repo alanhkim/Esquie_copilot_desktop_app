@@ -78,6 +78,13 @@ function makeElement(tag, className, text) {
   return element;
 }
 
+function inertHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url.href : '';
+  } catch { return ''; }
+}
+
 function formatDate(value) {
   if (typeof value !== 'string' || !value) return '';
   const date = new Date(value);
@@ -309,6 +316,10 @@ function renderJobs() {
   documents.replaceChildren();
   if (!workspace.documents?.length) documents.append(makeElement('p', 'empty-lane', 'No local documents created.'));
   for (const document of workspace.documents || []) {
+    if (document.fileUnavailableReason) {
+      documents.append(makeElement('p', 'muted', `${document.title} · ${document.fileUnavailableReason}`));
+      continue;
+    }
     const button = makeElement('button', 'button', `${document.title} · ${formatDate(document.createdAt)}`);
     button.addEventListener('click', async () => {
       try {
@@ -327,6 +338,11 @@ function renderBackups() {
   if (!workspace.backups.length) host.append(makeElement('p', 'muted', 'No verified state snapshots saved.'));
   for (const backup of workspace.backups) {
     const card = makeElement('article', 'job-card');
+    if (backup.fileUnavailableReason) {
+      card.append(makeElement('p', 'muted', `${formatDate(backup.createdAt)} · ${backup.fileUnavailableReason}`));
+      host.append(card);
+      continue;
+    }
     card.append(makeElement('p', '', `${formatDate(backup.createdAt)} · Consistent state snapshot · Partial coverage`));
     card.append(makeElement('small', '', `${backup.coverage.documents.metadataCount} local document metadata entries; files excluded. Sources: partial local evidence only.`));
     const button = makeElement('button', 'button', 'Prepare separate paused recovery');
@@ -344,7 +360,7 @@ function renderBackups() {
   }
   const recoveries = $('#recovery-list');
   recoveries.replaceChildren();
-  for (const recovery of workspace.recoveries) recoveries.append(makeElement('p', 'muted', `${recovery.message} Recovered directory: ${recovery.directory}`));
+  for (const recovery of workspace.recoveries) recoveries.append(makeElement('p', 'muted', recovery.fileUnavailableReason || `${recovery.message} Recovered directory: ${recovery.directory}`));
 }
 
 function renderRecords() {
@@ -357,6 +373,16 @@ function renderRecords() {
       const card = makeElement('article', 'surface draft-card');
       card.append(makeElement('strong', '', record.title), makeElement('small', '', `${record.category} · ${record.date || 'No date'} · Owner-provided, unverified`));
       if (record.note) card.append(makeElement('p', '', record.note));
+      if (record.sourceUrl) {
+        const href = inertHttpUrl(record.sourceUrl);
+        const source = makeElement(href ? 'a' : 'small', 'saved-link', href ? 'Open saved source link' : 'Invalid source link not opened');
+        if (href) source.href = href;
+        if (href) {
+          source.target = '_blank';
+          source.rel = 'noopener noreferrer';
+        }
+        card.append(source);
+      }
       const edit = makeElement('button', 'button', 'Edit local entry');
       edit.type = 'button';
       edit.addEventListener('click', () => {
@@ -374,6 +400,102 @@ function renderRecords() {
     }
   }
 }
+
+let outcomesImportPreview = null;
+const outcomeImportForm = $('#outcome-import-form');
+const outcomeImportText = outcomeImportForm.elements.text;
+const outcomeImportResult = $('#outcome-import-preview-result');
+const outcomeImportReview = outcomeImportForm.elements.reviewed;
+const outcomeImportConfirm = $('#outcome-import-confirm');
+const outcomeImportReject = $('#outcome-import-reject');
+
+function renderOutcomeImportPreview() {
+  outcomeImportResult.replaceChildren();
+  const rows = outcomesImportPreview?.rows || [];
+  if (outcomesImportPreview) {
+    const summary = makeElement('p', 'muted', `Preview: ${rows.filter(row => row.state === 'new').length} new, ${rows.filter(row => row.state === 'duplicate').length} duplicate, ${rows.filter(row => row.state === 'conflict').length} conflict. Conflicts and duplicates are not overwritten.`);
+    outcomeImportResult.append(summary);
+    const list = makeElement('div', 'draft-list');
+    for (const { state, record } of rows) {
+      const card = makeElement('article', 'draft-card');
+      card.append(makeElement('strong', '', `${state}: ${record.title}`));
+      card.append(makeElement('small', '', `${record.date} · ${record.workshopImport.status} · owner-pasted, unverified`));
+      if (record.note) card.append(makeElement('p', '', record.note));
+      if (record.sourceUrl) {
+        const href = inertHttpUrl(record.sourceUrl);
+        const link = makeElement(href ? 'a' : 'small', 'saved-link', href ? 'Saved source link (not fetched)' : 'Invalid source link not opened');
+        if (href) {
+          link.href = href;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+        }
+        card.append(link);
+      }
+      list.append(card);
+    }
+    outcomeImportResult.append(list);
+  }
+  const hasNew = rows.some(row => row.state === 'new');
+  $('#outcome-import-review-row').hidden = !outcomesImportPreview || !hasNew;
+  outcomeImportConfirm.disabled = !outcomesImportPreview || !hasNew || !outcomeImportReview.checked;
+  outcomeImportReject.disabled = !outcomesImportPreview;
+}
+
+outcomeImportText.addEventListener('input', () => {
+  outcomesImportPreview = null;
+  outcomeImportReview.checked = false;
+  renderOutcomeImportPreview();
+});
+outcomeImportForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = $('#outcome-import-preview');
+  button.disabled = true;
+  try {
+    outcomesImportPreview = await api('/api/outcomes/import/preview', {
+      method: 'POST', body: JSON.stringify({ text: outcomeImportText.value })
+    });
+    outcomeImportReview.checked = false;
+    renderOutcomeImportPreview();
+    showNotice('Preview ready. Review each row; nothing has been imported.');
+  } catch (error) {
+    outcomesImportPreview = null;
+    outcomeImportReview.checked = false;
+    renderOutcomeImportPreview();
+    showNotice(error.message, true);
+  } finally { button.disabled = false; }
+});
+outcomeImportReview.addEventListener('change', renderOutcomeImportPreview);
+outcomeImportReject.addEventListener('click', () => {
+  outcomesImportPreview = null;
+  outcomeImportReview.checked = false;
+  renderOutcomeImportPreview();
+  showNotice('Preview discarded. No outcomes were changed.');
+});
+outcomeImportConfirm.addEventListener('click', async () => {
+  if (!outcomesImportPreview || !outcomeImportReview.checked) return;
+  outcomeImportConfirm.disabled = true;
+  try {
+    const result = await api('/api/outcomes/import/confirm', {
+      method: 'POST',
+      body: JSON.stringify({
+        text: outcomeImportText.value,
+        revision: outcomesImportPreview.revision,
+        textHash: outcomesImportPreview.textHash,
+        reviewed: true
+      })
+    });
+    outcomesImportPreview = null;
+    outcomeImportReview.checked = false;
+    renderOutcomeImportPreview();
+    await refreshState();
+    showNotice(`Imported ${result.imported}; skipped ${result.duplicates} duplicate and ${result.conflicts} conflicting rows.`);
+  } catch (error) {
+    showNotice(error.message, true);
+    outcomesImportPreview = null;
+    outcomeImportReview.checked = false;
+    renderOutcomeImportPreview();
+  }
+});
 
 const setupTitles = ['Your profile', 'Manager and people', 'Account portfolio', 'Workspace', 'Writing style', 'Monthly outcomes', 'Source configuration', 'Review'];
 

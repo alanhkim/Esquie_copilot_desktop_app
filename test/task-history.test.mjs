@@ -4,12 +4,18 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { newWorkspace } from '../src/store.mjs';
+import { adoptLegacyWorkspace, newWorkspace } from '../src/store.mjs';
 import { startServer } from '../src/server.mjs';
 
 async function setup(t, legacy) {
   const root = await mkdtemp(join(tmpdir(), 'esquie-task-history-'));
-  if (legacy) await writeFile(join(root, 'workspace.json'), JSON.stringify(legacy), { mode: 0o600 });
+  let source;
+  if (legacy) {
+    source = await mkdtemp(join(tmpdir(), 'esquie-task-legacy-'));
+    t.after(() => rm(source, { force: true, recursive: true }));
+    await writeFile(join(source, 'workspace.json'), JSON.stringify(legacy), { mode: 0o600 });
+    await adoptLegacyWorkspace({ source, destination: root, confirmed: true });
+  }
   let now = new Date('2026-03-04T10:00:00Z');
   let app = await startServer({ dataDir: root, port: 0, workerIntervalMs: 0, clock: () => now });
   t.after(async () => { await app.close(); await rm(root, { force: true, recursive: true }); });
@@ -19,7 +25,7 @@ async function setup(t, legacy) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) })
   });
   return {
-    root, state, request, clock(value) { now = new Date(value); },
+    root, source, state, request, clock(value) { now = new Date(value); },
     async restart() {
       await app.close();
       app = await startServer({ dataDir: root, port: 0, workerIntervalMs: 0, clock: () => now });
@@ -69,5 +75,5 @@ test('legacy tasks keep known creation dates/completed state and never receive i
   state = await context.state();
   assert.deepEqual(state.tasks[0].history.map(event => event.kind), ['reopened']);
   assert.equal(state.tasks[0].createdAt, undefined);
-  assert.equal(await readFile(join(context.root, 'workspace.json'), 'utf8'), JSON.stringify(legacy));
+  assert.equal(await readFile(join(context.source, 'workspace.json'), 'utf8'), JSON.stringify(legacy));
 });

@@ -1,11 +1,37 @@
 import { execFile } from 'node:child_process';
 import { lstat, readdir, realpath } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 const execute = promisify(execFile);
 const failure = 'Current-user-only storage protection could not be verified. Use a protected local folder; existing data and existing permissions were not replaced.';
-const names = ['workspace.sqlite', 'workspace.sqlite-wal', 'workspace.sqlite-shm', 'workspace.json', 'workspace.lock', 'esquie-launch.html', 'documents', 'backups', 'recoveries'];
+const names = ['workspace.sqlite', 'workspace.sqlite-wal', 'workspace.sqlite-shm', 'workspace.sqlite-journal', 'workspace.owner', 'workspace.json', 'workspace.lock', 'esquie-launch.html', 'documents', 'backups', 'recoveries'];
+const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+export function assertPrivateDataDirectory(path) {
+  const candidate = resolve(path);
+  let customSyncRoots;
+  try { customSyncRoots = JSON.parse(process.env.ESQUIE_SYNC_ROOTS || '[]'); }
+  catch { throw new Error('ESQUIE_SYNC_ROOTS must be a JSON array of absolute local paths.'); }
+  if (!Array.isArray(customSyncRoots) || customSyncRoots.some(value => typeof value !== 'string' || !isAbsolute(value))) {
+    throw new Error('ESQUIE_SYNC_ROOTS must be a JSON array of absolute local paths.');
+  }
+  const pathContains = (parent, child) => {
+    const rel = relative(parent, child);
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+  const syncRoots = [
+    process.env.OneDrive, process.env.OneDriveCommercial, process.env.OneDriveConsumer,
+    process.env.Dropbox, process.env.GOOGLE_DRIVE, process.env.ICLOUD_DRIVE, ...customSyncRoots
+  ].filter(Boolean).map(path => resolve(path));
+  if (pathContains(appRoot, candidate) || /^\\\\/.test(candidate) ||
+      syncRoots.some(syncRoot => pathContains(syncRoot, candidate)) ||
+      /(?:^|[\\/])(?:onedrive(?:\s+-\s+[^\\/]+)?|sharepoint|dropbox(?:\s+\([^\\/]+\))?|google[\s-]?drive|my drive|icloud(?:drive)?|box(?: sync| drive)?|nextcloud|syncthing)(?:[\\/]|$)/i.test(candidate)) {
+    throw new Error('Choose a local data directory outside the application repository and cloud-synced folders.');
+  }
+  return candidate;
+}
 
 export function runSystemPowerShell(script, environment = {}) {
   const systemRoot = process.env.SystemRoot;
@@ -44,7 +70,7 @@ if ($env:ESQUIE_STORAGE_CREATE_PRIVATE -eq 'true') {
   Set-Acl -LiteralPath $path -AclObject $security
 }
 $paths = @($path)
-foreach ($name in @('workspace.sqlite','workspace.sqlite-wal','workspace.sqlite-shm','workspace.json','workspace.lock','esquie-launch.html','documents','backups','recoveries')) {
+foreach ($name in @('workspace.sqlite','workspace.sqlite-wal','workspace.sqlite-shm','workspace.sqlite-journal','workspace.owner','workspace.json','workspace.lock','esquie-launch.html','documents','backups','recoveries')) {
   $candidate = Join-Path $path $name
   if (Test-Path -LiteralPath $candidate) {
     $paths += $candidate

@@ -210,7 +210,16 @@
 
       <section id="view-outcomes" class="view" hidden>
         <div class="page-heading"><div><p class="eyebrow">A RECORD OF CUSTOMER IMPACT</p><h1>Monthly <em>Outcomes.</em></h1><p>Reporting is not configured. No business data has been queried.</p></div></div>
-        <div class="empty-panel"><span class="tag">SOURCE REPORTING DISCONNECTED</span><h2>Record your own local outcomes</h2><p>Entries below are owner-provided, not verified reporting or imported wins. No workshop import, report query, or automatic suggestion is implied.</p></div>
+        <div class="empty-panel"><span class="tag">SOURCE REPORTING DISCONNECTED</span><h2>Record your own local outcomes</h2><p>Entries below are owner-provided and unverified. Reporting is not configured; no live source read or automatic suggestion is implied.</p></div>
+        <form id="outcome-import-form" class="surface form profile-form">
+          <h2>Import owner-pasted workshops</h2>
+          <p>Paste a Markdown or tab-separated table with Date, Account and Workshop columns. Optional columns: Status, Notes and Source URL. Missing status remains “Not provided.” Future-delivered dates are checked only when your owner timezone is configured in Operations. Preview is local and read-only; source links are saved as inert references and never fetched.</p>
+          <label>Workshop table<textarea name="text" rows="7" maxlength="16000" required placeholder="Date | Account | Workshop | Status | Notes | Source URL&#10;2026-10-12 | Example Account | Example workshop | Delivered | Owner-provided note | https://example.invalid/workshop"></textarea></label>
+          <div class="workflow-actions"><button id="outcome-import-preview" type="submit" class="button">Preview import</button><button id="outcome-import-reject" type="button" class="button" disabled>Discard preview</button></div>
+          <div id="outcome-import-preview-result" aria-live="polite"></div>
+          <label id="outcome-import-review-row" class="inline-check" hidden><input name="reviewed" type="checkbox"> I reviewed this preview and confirm importing only the new rows shown.</label>
+          <button id="outcome-import-confirm" type="button" class="button primary" disabled>Confirm local import</button>
+        </form>
         <form id="outcome-form" class="surface form profile-form">
           <label>Outcome or engagement<select name="category"><option value="outcome">Outcome</option><option value="engagement">Strategic engagement</option></select></label>
           <label>Title<input name="title" maxlength="160" required></label>

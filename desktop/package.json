@@ -33,7 +33,7 @@
     ],
     "extraResources": [
       { "from": "../src", "to": "workspace/src", "filter": [
-        "server.mjs", "store.mjs", "worker.mjs", "backups.mjs",
+        "server.mjs", "store.mjs", "worker.mjs", "backups.mjs", "monthly-outcomes-import.mjs",
         "local-output.mjs", "private-storage.mjs",
         "assistant/bridge.mjs", "connectors/microsoft365.mjs"
       ] },
