@@ -6,7 +6,7 @@ An independently authored, local-first chief-of-staff workspace: tasks and conve
 
 **Connections are disconnected by default.** Microsoft 365 adapters require a trustworthy, separately authorized host token provider; no sign-in provider is installed here. Copilot remains unavailable until an audited runtime and identity boundary exist. No tests access real accounts.
 
-> **Unresolved queue/retry warnings:** resubmitting after an uncertain response with a new request ID can duplicate work. Inspect Activity and any output before resubmitting. Generic demo Retry reuses saved fake-only confirmation rather than asking for renewed per-run consent; do not retry demos. The separate fixes are not included here.
+> **Unresolved queue/retry warnings:** generic queue controls create a fresh request ID per click and do not distinguish an accepted job followed by display-refresh failure from an unknown submission. Repeated clicks or retries can duplicate local outlines, documents, backups, meeting notes or bounded source checks. **Click once and inspect Activity and any output before retrying**, even if the UI reports an error. Generic demo Retry reuses saved fake-only confirmation rather than asking for renewed per-run consent; do not retry demos. The separate fixes are not included here.
 
 ## Requirements and startup
 
