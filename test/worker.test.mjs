@@ -637,6 +637,102 @@ test('approved Word summaries preserve local task text and expose only a verifie
   assert.equal((await afterRestart.json()).contentSha256, document.contentSha256);
 });
 
+test('Word and PowerPoint details distinguish root inspection from bounded file failures', async t => {
+  for (const format of ['docx', 'pptx']) {
+    await t.test(format, async t => {
+      let volumeMode = 'available';
+      const context = await setup(t, {
+        verifyLocalVolume: async () => {
+          if (volumeMode === 'throw') throw new Error(`synthetic-secret ${context.root}`);
+          return volumeMode === 'available';
+        }
+      });
+      assert.equal((await context.request('/api/output-approval', { confirmPrivateNonSynced: true })).status, 200);
+      if (format === 'pptx') {
+        assert.equal((await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: true })).status, 200);
+      }
+      const request = format === 'docx'
+        ? { kind: 'word_document', requestId: randomUUID() }
+        : { kind: 'fake_demo', requestId: randomUUID(), confirmFakeOnly: true, format: 'pptx' };
+      const queued = await context.request('/api/jobs', request);
+      assert.equal(queued.status, 202);
+      const { job } = await queued.json();
+      await context.app.worker.tick();
+      const document = (await context.state()).documents.find(item => item.id === job.id);
+      assert.ok(document);
+      const file = join(context.root, 'documents', `${job.id}.${format}`);
+      const original = await readFile(file);
+      const endpoint = `/api/documents/${job.id}`;
+      const rootError = 'The local workspace root or volume could not be verified; document reading was blocked.';
+      const fileError = `The ${format === 'docx' ? 'Word' : 'PowerPoint'} file could not be verified as a bounded, single-link file on the workspace volume.`;
+      async function expectError(expected) {
+        const response = await context.request(endpoint, undefined, 'GET');
+        assert.equal(response.status, 409);
+        const body = await response.json();
+        assert.deepEqual(body, { error: expected });
+        assert.doesNotMatch(JSON.stringify(body), /synthetic-secret/);
+        assert.equal(JSON.stringify(body).includes(context.root), false);
+      }
+      async function expectSuccess() {
+        const response = await context.request(endpoint, undefined, 'GET');
+        assert.equal(response.status, 200, await response.clone().text());
+        const body = await response.json();
+        assert.equal(body.format, format);
+        assert.equal(body.contentSha256, document.contentSha256);
+        assert.equal(body.contentBytes, original.length);
+      }
+
+      await expectSuccess();
+      let fileOpenCalls = 0;
+      const originalOpen = fs.promises.open;
+      const openHook = t.mock.method(fs.promises, 'open', async (...args) => {
+        if (args[0] === file) fileOpenCalls++;
+        return originalOpen(...args);
+      });
+      syncBuiltinESMExports();
+      try {
+        for (volumeMode of ['unavailable', 'throw']) await expectError(rootError);
+        assert.equal(fileOpenCalls, 0);
+      } finally {
+        volumeMode = 'available';
+        openHook.mock.restore();
+        syncBuiltinESMExports();
+      }
+
+      const originalLstat = fs.promises.lstat;
+      let failingPath = context.root;
+      const hook = t.mock.method(fs.promises, 'lstat', async (...args) => {
+        if (args[0] === failingPath) throw new Error(`synthetic-secret ${context.root}`);
+        return originalLstat(...args);
+      });
+      syncBuiltinESMExports();
+      try {
+        await expectError(rootError);
+        failingPath = file;
+        await expectError(fileError);
+      } finally {
+        hook.mock.restore();
+        syncBuiltinESMExports();
+      }
+
+      const hardlink = join(context.root, `linked-synthetic.${format}`);
+      await link(file, hardlink);
+      try { await expectError(fileError); }
+      finally { await unlink(hardlink); }
+
+      const changed = Buffer.from(original);
+      changed[0] ^= 0xff;
+      await writeFile(file, changed);
+      try {
+        await expectError('The local document no longer matches its generation record; reading was blocked.');
+      } finally { await writeFile(file, original); }
+      assert.deepEqual((await context.state()).documents.find(item => item.id === job.id), document);
+      await context.restart();
+      await expectSuccess();
+    });
+  }
+});
+
 test('real Word worker preserves supplementary Unicode and visible line breaks before and after restart', async t => {
   const context = await setup(t);
   assert.equal((await context.request('/api/output-approval', { confirmPrivateNonSynced: true })).status, 200);

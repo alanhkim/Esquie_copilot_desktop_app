@@ -937,15 +937,21 @@ export async function startServer({
               document.contentBytes > MAX_LOCAL_DOCUMENT_BYTES || !SHA256.test(document.contentSha256 || '')) {
             throw new HttpError(409, `The ${format === 'docx' ? 'Word' : 'PowerPoint'} generation record is missing or invalid; reading was blocked.`);
           }
+          let volume;
           try {
             const rootMetadata = await lstat(root, { bigint: true });
             if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink() ||
                 await realpath(root) !== resolve(root) || !await verifyLocalVolume(root)) {
               throw new Error('The workspace volume could not be verified.');
             }
+            volume = rootMetadata.dev;
+          } catch {
+            throw new HttpError(409, 'The local workspace root or volume could not be verified; document reading was blocked.');
+          }
+          try {
             bytes = await readVerifiedLocalFile(path, {
               limit: MAX_LOCAL_DOCUMENT_BYTES,
-              volume: rootMetadata.dev
+              volume
             });
           } catch {
             throw new HttpError(409, `The ${format === 'docx' ? 'Word' : 'PowerPoint'} file could not be verified as a bounded, single-link file on the workspace volume.`);

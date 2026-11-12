@@ -101,19 +101,19 @@ Make a separate backup before any installation change; no data migration or
 downgrade is promised by this wrapper. The first launch initializes a new
 workspace. The wrapper does not import any other installation or its data.
 This desktop default differs from the standalone dashboard default. To use the
-same **verified recreation** workspace, quit its current host and use the guarded
-[later-launch command](../README.md#requirements-and-startup), choosing `desktop`
-and that exact private local directory.
-
-Set the variable in the environment that launches the desktop app; a shortcut or
-sign-in startup may not inherit a terminal-only setting. With no override, the
-desktop default remains unchanged. The server applies the same ownership, lock,
-private-storage and recovery checks as standalone; an unsafe or already-open
-workspace is refused. No workspace is moved, copied, merged or overwritten by
-this selection. For a separately prepared paused recovery or explicit legacy
-adoption, quit the owning host and set the override to the resulting verified
-directory; follow the repository's [recovery guidance](../README.md#storage-output-and-upgrades)
-before resuming or reconnecting. Never select the original installation.
+same **verified recreation** workspace, quit its current host and set
+`ESQUIE_DATA_DIR` to that private local directory using the guarded later-launch
+command in the repository's [startup instructions](../README.md#requirements-and-startup)
+with `desktop` mode. Set it in the environment that launches the desktop app; a
+shortcut or sign-in startup may not inherit a terminal-only setting. With no
+override, the desktop default remains unchanged. The server applies the same
+ownership, lock, private-storage and recovery checks as standalone; an unsafe or
+already-open workspace is refused. No workspace is moved, copied, merged or
+overwritten by this selection. For a separately prepared paused recovery or
+explicit legacy adoption, quit the owning host and select the resulting verified
+directory with that same guarded command; follow the repository's
+[recovery guidance](../README.md#storage-output-and-upgrades) before resuming or
+reconnecting. Never select the original installation.
 Windows sign-in startup is **off by default** and can be enabled explicitly in
 the application or tray menu for an installed build. It is unavailable in dev mode.
 The synthetic smoke uses a fake server to verify protected launch and reload;
