@@ -1,5 +1,7 @@
 # Esquie local workspace
 
+> **STOP: Do not start this baseline until the workspace-ownership fix lands.** Startup can alter an unrelated existing database before proving it belongs to this recreation. Do not point it at an original installation or existing workspace. This source baseline is not safe to run pending that fix.
+
 An independently authored, local-first chief-of-staff workspace: tasks and conversations, an unsent draft studio, a durable worker, local documents, owner-entered accounts/outcomes, and an optional Windows tray host. It is not a full reproduction of the private reference; see the [feature-by-feature parity report](docs/parity-report.md).
 
 > **Incomplete source baseline, not a release-ready desktop distribution.** The desktop npm audit summary reported **six moderate issues**; advisory/package details were unavailable. No policy-compliant fresh Electron installation or real installer validation has been established. Earlier desktop artifacts have unverified policy provenance and must not be reused, distributed or published. Source publication does not resolve these limits; additional outcome-import and connector work is still in progress.
