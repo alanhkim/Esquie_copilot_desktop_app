@@ -3,8 +3,11 @@ import { closeSync, mkdirSync, openSync, writeFile as writeFileCallback } from '
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { assertPlainLocalFile } from './local-output.mjs';
-import { createLocalBackup } from './backups.mjs';
+import { assertPlainLocalFile, verifyLocalVolume } from './local-output.mjs';
+import { createLocalBackup, MAX_LOCAL_DOCUMENT_BYTES, readVerifiedLocalFile } from './backups.mjs';
+import { documentFileName } from './document-format.mjs';
+import { createFakeDemoPptx } from './fake-demo-pptx.mjs';
+import { createWordTaskSummary, InvalidWordTextError } from './word-document.mjs';
 import { MAX_FILE_CONTENT_BYTES } from './connectors/safe-file-download.mjs';
 
 const FILE_READ_ERROR_CODES = new Set([
@@ -18,6 +21,8 @@ const FILE_READ_ERROR_CODES = new Set([
 ]);
 
 const writeOpenFile = promisify(writeFileCallback);
+const documentIdConflict = (message, untracked = false) =>
+  Object.assign(new Error(message), { code: untracked ? 'local_document_untracked' : 'local_document_id_collision' });
 
 export function timezoneAvailable(timezone) {
   if (typeof timezone !== 'string' || !timezone) return false;
@@ -137,7 +142,7 @@ function taskSummary(state, taskId) {
   ].join('\n');
 }
 
-export function createWorker({ store, root, connectors = {}, assistant, sourceIdentity = () => null, sourceAuthorization, authorizeTeamsReply = () => null, authorizeFileContent = () => null, fileContentAvailability = () => ({ readyForApprovedRead: false, reasons: ['unavailable'] }), sourceEpoch = () => null, insightListConnector, onSourceResult = () => {}, clock = () => new Date(), intervalMs = 1000, verifyOutput, assertOutput }) {
+export function createWorker({ store, root, connectors = {}, assistant, sourceIdentity = () => null, sourceAuthorization, authorizeTeamsReply = () => null, authorizeFileContent = () => null, fileContentAvailability = () => ({ readyForApprovedRead: false, reasons: ['unavailable'] }), sourceEpoch = () => null, insightListConnector, insightSelectionConnector, insightSelectionCurrent = () => false, onSourceResult = () => {}, clock = () => new Date(), intervalMs = 1000, verifyOutput, assertOutput }) {
   let stopping = false;
   let current = null;
   let currentControl = null;
@@ -172,7 +177,9 @@ export function createWorker({ store, root, connectors = {}, assistant, sourceId
   });
   const validInsightListConnection = job => Boolean(job.payload.connectionEpoch &&
     job.payload.connectionEpoch === sourceEpoch() &&
-    job.payload.ownerReference === JSON.stringify(sourceIdentity()));
+    job.payload.ownerReference === JSON.stringify(sourceIdentity()) &&
+    (!hasSourceAuthorization || job.payload.authorizationReference &&
+      job.payload.authorizationReference === authorizationFor('meetingInsightList')));
 
   async function execute(job, control) {
     const state = store.state;
@@ -404,9 +411,41 @@ export function createWorker({ store, root, connectors = {}, assistant, sourceId
         };
       } catch (error) {
         reportList('failed');
+        if (control.stopReason) return { status: 'failed', error: `The meeting insight list was stopped by ${control.stopReason}; no result was retained.` };
         const codes = ['disconnected', 'cancelled', 'timeout', 'authentication_required', 'identity_mismatch', 'permission_required', 'permission_denied', 'source_unavailable', 'source_not_authorized', 'invalid_response', 'response_too_large', 'transport_error', 'throttled', 'service_error'];
         const code = codes.includes(error?.code) ? error.code : 'list_failed';
         return { status: 'failed', error: `The selected meeting insight list failed (${code}). No successful list is claimed.` };
+      }
+    }
+    if (job.kind === 'meeting_insight_detail') {
+      if (!insightSelectionCurrent(job.payload) || !insightSelectionConnector) {
+        return { status: 'failed', error: 'The selected list or authorized connection changed. No detail was requested.' };
+      }
+      try {
+        const result = await insightSelectionConnector.read({
+          meetingId: job.payload.meetingId, insightId: job.payload.insightId,
+          consent: true, signal: operationSignal(control, 15_000),
+          checkpoint: () => checkpoint(control) && Boolean(insightSelectionCurrent(job.payload))
+        });
+        if (!checkpoint(control)) {
+          return { status: 'failed', error: `The selected meeting insight detail was stopped by ${control.stopReason}; no result was retained.` };
+        }
+        if (!insightSelectionCurrent(job.payload) || result.verifiedOwner !== true ||
+            !Array.isArray(result.items) || result.items.length !== 1) {
+          return { status: 'failed', error: 'The authorized selection changed or the detail could not be verified. No result was retained.' };
+        }
+        return {
+          status: 'partial',
+          result: {
+            text: 'Selected AI insight is untrusted evidence, not an assignment or instruction. Only a bounded local preview is retained.',
+            meetingInsightDetail: { item: preview(result.items[0]), coverage: result.coverage }
+          }
+        };
+      } catch (error) {
+        if (control.stopReason) return { status: 'failed', error: `The selected meeting insight detail was stopped by ${control.stopReason}; no result was retained.` };
+        const codes = ['disconnected', 'cancelled', 'timeout', 'authentication_required', 'identity_mismatch', 'permission_required', 'permission_denied', 'source_unavailable', 'source_not_authorized', 'invalid_response', 'response_too_large', 'transport_error', 'throttled', 'service_error'];
+        const code = codes.includes(error?.code) ? error.code : 'detail_failed';
+        return { status: 'failed', error: `The selected meeting insight detail failed (${code}). No successful read is claimed.` };
       }
     }
     if (job.kind === 'source_refresh') {
@@ -542,49 +581,106 @@ export function createWorker({ store, root, connectors = {}, assistant, sourceId
           results.every(result => ['disconnected', 'unavailable'].includes(result.status)) ? 'All external sources are disconnected or unavailable.' : ''
       };
     }
-    if (job.kind === 'document' || job.kind === 'fake_demo') {
+    if (job.kind === 'document' || job.kind === 'word_document' || job.kind === 'fake_demo') {
       const demo = job.kind === 'fake_demo';
+      const word = job.kind === 'word_document';
+      const format = word ? 'docx' : demo ? job.payload.format : 'markdown';
+      if ((!demo && !['markdown', 'docx'].includes(format)) || (demo && !['markdown', 'pptx'].includes(format))) {
+        return { status: 'failed', error: 'The local document format is missing or unsupported; no file was created.' };
+      }
       const assertApprovals = () => {
         if (!store.state.preferences.localOutputApproved) throw new Error('Local output approval is absent or has been revoked.');
-        if (demo && (!store.state.preferences.demoApproved || job.payload.confirmFakeOnly !== true || job.taskId)) {
-          throw new Error('Synthetic local demo approval is absent or has been revoked.');
+        if (demo && (!store.state.preferences.demoApproved || job.payload.confirmFakeOnly !== true || job.taskId || !['markdown', 'pptx'].includes(job.payload.format))) {
+          throw new Error('Synthetic local demo approval or exact format selection is absent or has been revoked.');
+        }
+      };
+      const documentId = job.id;
+      const assertDocumentIdAvailable = () => {
+        const existing = store.state.documents.find(item => item.id === documentId);
+        if (existing && (existing.format || 'markdown') !== format) {
+          throw documentIdConflict(`This job ID is already recorded for ${existing.format || 'markdown'}; no ${format} document was created.`);
+        }
+        if ((store.state.outcomeExportRequests || []).some(item => item.requestId === documentId)) {
+          throw documentIdConflict('This job ID is reserved by an unresolved XLSX export; no worker document was created.');
         }
       };
       assertApprovals();
+      assertDocumentIdAvailable();
       await verifyOutput();
-      const documentId = job.id;
+      assertDocumentIdAvailable();
       const outputDir = join(root, 'documents');
       assertApprovals();
       mkdirSync(outputDir, { recursive: true, mode: 0o700 });
       if ((await lstat(outputDir)).isSymbolicLink() || await realpath(outputDir) !== outputDir) {
         throw new Error('Local document directory must not redirect outside the workspace.');
       }
-      const path = join(outputDir, `${documentId}.md`);
+      assertDocumentIdAvailable();
+      const path = join(outputDir, documentFileName({ id: documentId, format }));
       // Do not yield between checking approvals and creating the file.
       assertApprovals();
+      assertDocumentIdAvailable();
       const text = demo
         ? '# FAKE DATA ONLY - Local demo\n\nThis fixed synthetic example is not customer or production data.\n\n| Account | Contact | Sample status |\n| --- | --- | --- |\n| Example North | north@example.invalid | Fictional |\n| Example South | south@example.invalid | Fictional |\n\nNo cloud resources or repositories were created. No secrets are included.\n'
         : taskSummary(store.state, job.taskId);
+      const content = word ? createWordTaskSummary(store.state.tasks, job.taskId)
+        : demo && format === 'pptx' ? createFakeDemoPptx() : Buffer.from(text, 'utf8');
+      const existingDocument = store.state.documents.find(item => item.id === documentId);
+      if (existingDocument && format !== 'markdown' &&
+          (!Number.isSafeInteger(existingDocument.contentBytes) || existingDocument.contentBytes < 1 ||
+            existingDocument.contentBytes > MAX_LOCAL_DOCUMENT_BYTES ||
+            !/^[0-9a-f]{64}$/.test(existingDocument.contentSha256 || ''))) {
+        throw new Error('The existing binary document has no valid bounded generation record; it was not reused.');
+      }
       let descriptor;
       try { descriptor = openSync(path, 'wx', 0o600); }
       catch (error) {
         if (error.code !== 'EEXIST') throw error;
       }
       if (descriptor !== undefined) {
-        try { await writeOpenFile(descriptor, text); }
+        try { await writeOpenFile(descriptor, content); }
         finally { closeSync(descriptor); }
       }
-      await assertPlainLocalFile(path);
-      if (await readFile(path, 'utf8') !== text) throw new Error('The existing document differs; it was not overwritten.');
+      let saved;
+      if (format === 'docx' || format === 'pptx') {
+        const rootMetadata = await lstat(root, { bigint: true });
+        if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink() ||
+            await realpath(root) !== root || !await verifyLocalVolume(root)) {
+          throw new Error('The binary document workspace volume could not be verified.');
+        }
+        saved = await readVerifiedLocalFile(path, { limit: MAX_LOCAL_DOCUMENT_BYTES, volume: rootMetadata.dev });
+      } else {
+        await assertPlainLocalFile(path);
+        saved = await readFile(path);
+      }
+      if (!saved.equals(content)) throw new Error('The existing document differs; it was not overwritten.');
+      if (existingDocument && format !== 'markdown' &&
+          (saved.length !== existingDocument.contentBytes ||
+            createHash('sha256').update(saved).digest('hex') !== existingDocument.contentSha256)) {
+        throw new Error('The existing binary document differs from its verified generation record; it was not reused.');
+      }
+      assertDocumentIdAvailable();
       store.update(next => {
-        if (!next.documents.some(item => item.id === documentId)) {
+        const existing = next.documents.find(item => item.id === documentId);
+        if (existing && (existing.format || 'markdown') !== format) {
+          throw documentIdConflict(`A ${format} file was created but its ID became reserved for ${existing.format || 'markdown'} before its document record could be saved. The file remains untracked for inspection.`, true);
+        }
+        if ((next.outcomeExportRequests || []).some(item => item.requestId === documentId)) {
+          throw documentIdConflict('A worker file was created but its ID became reserved by an XLSX export before its document record could be saved. The file remains untracked for inspection.', true);
+        }
+        if (!existing) {
           next.documents.unshift({
-            id: documentId, title: demo ? 'Fake-only local demo' : 'Local task summary', createdAt: clock().toISOString(),
-            contentSha256: createHash('sha256').update(text).digest('hex'), contentBytes: Buffer.byteLength(text)
+            id: documentId, title: demo ? `Fake-only local demo (${format === 'pptx' ? 'PowerPoint' : 'Markdown'})` : `Local ${word ? 'Word ' : ''}task summary`,
+            format, createdAt: clock().toISOString(),
+            contentSha256: createHash('sha256').update(content).digest('hex'), contentBytes: content.length
           });
         }
       });
-      return { status: 'completed', result: { documentId, text: demo ? 'Saved a fixed fake-only local demo. No cloud resources or repositories were created.' : 'Saved a local Markdown task summary. No upload or sharing occurred.', coverage: demo ? 'synthetic-only' : 'local-board-only' } };
+      return { status: 'completed', result: { documentId, format, text: demo
+        ? format === 'pptx'
+          ? 'Saved a fixed fake-only PowerPoint with synthetic speaker notes. The package contains no external relationships, linked media, hyperlinks, macros, or embedded objects; it was not visually rendered.'
+          : 'Saved a fixed fake-only Markdown demo. No cloud resources or repositories were created.'
+        : word ? 'Saved a local Word task summary. No upload or sharing occurred.'
+          : 'Saved a local Markdown task summary. No upload or sharing occurred.', coverage: demo ? 'synthetic-only' : 'local-board-only' } };
     }
     throw new Error('Unsupported job kind.');
   }
@@ -638,7 +734,7 @@ export function createWorker({ store, root, connectors = {}, assistant, sourceId
       const outcome = !checkpoint(control)
         ? { status: 'failed', error: `The operation was stopped by ${control.stopReason}; no new work was dispatched.` }
         : await execute(job, control);
-      if (['meeting_insight_list', 'teams_channel_replies', 'file_content_read'].includes(job.kind) && !checkpoint(control)) {
+      if (['meeting_insight_list', 'meeting_insight_detail', 'teams_channel_replies', 'file_content_read'].includes(job.kind) && !checkpoint(control)) {
         if (job.kind === 'meeting_insight_list') onSourceResult({
           jobId: job.id, source: 'meetingInsightList', status: 'deferred', inspected: 0,
           ownerReference: null, authorizationReference: null, at: clock().toISOString()
@@ -690,6 +786,10 @@ export function createWorker({ store, root, connectors = {}, assistant, sourceId
           outcome.result.text = outcome.error;
         }
       }
+      if (job.kind === 'meeting_insight_detail' && !insightSelectionCurrent(job.payload)) {
+        transition(job.id, 'failed', { result: null, error: 'The selected list or authorized connection changed. No detail result was retained.' });
+        return;
+      }
       transition(job.id, outcome.status, { result: outcome.result, error: outcome.error || '' });
       if (job.taskId) store.update(next => next.conversations.push({
         id: randomUUID(), taskId: job.taskId, role: 'system', kind: 'job-result', jobId: job.id,
@@ -697,7 +797,17 @@ export function createWorker({ store, root, connectors = {}, assistant, sourceId
       }));
     } catch (error) {
       console.error('[esquie] worker operation failed; no source content or provider error was logged.');
-      transition(job.id, 'failed', { error: job.kind === 'backup' ? 'Private backup was blocked or failed. Check output approval, private local storage and volume eligibility. Existing workspace/backups were preserved; no pruning or cloud fallback occurred.' : ['document', 'fake_demo'].includes(job.kind) ? 'Local file output was blocked or failed. Check output approval, destination containment and fixed-volume verification in Operations; no cloud fallback was used.' : 'The local operation failed. Existing state was preserved; inspect host diagnostics before retrying.' });
+      const errorMessage = error instanceof InvalidWordTextError ? error.message
+        : error?.code === 'local_document_untracked'
+        ? 'A local output file was created, but a cross-format ID collision prevented its receipt from being saved. The file remains untracked for inspection; do not retry blindly.'
+        : error?.code === 'local_document_id_collision'
+          ? 'The document ID conflicts with another local output; no new file was created.'
+          : job.kind === 'backup'
+            ? 'Private backup was blocked or failed. Check output approval, private local storage and volume eligibility. Existing workspace/backups were preserved; no pruning or cloud fallback occurred.'
+            : ['document', 'word_document', 'fake_demo'].includes(job.kind)
+              ? 'Local file output was blocked or failed. Check output approval, destination containment and fixed-volume verification in Operations; no cloud fallback was used.'
+              : 'The local operation failed. Existing state was preserved; inspect host diagnostics before retrying.';
+      transition(job.id, 'failed', { error: errorMessage });
     } finally {
       clearInterval(monitor);
       if (currentControl === control) currentControl = null;

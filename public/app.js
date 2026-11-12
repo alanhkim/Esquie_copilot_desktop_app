@@ -1,5 +1,7 @@
 import { laneMove, matchingTasks } from './task-board.mjs';
-import { applyAccountSaveResult, bindAccountFormSubmission, canReplaceAccountTarget, createTextElement, inertHttpUrl, renderAccountRecords } from './account-workspace.mjs';
+import { completedWorkTasks, ownerLocalDateKey, recordedTimestamp } from './completed-work.mjs';
+import { bindLocalSspDirectory, renderMetricMatrix } from './portfolio-workspace.mjs';
+import { applyAccountSaveResult, bindAccountFormSubmission, bindAccountMetricForm, canReplaceAccountTarget, createTextElement, inertHttpUrl, renderAccountRecords } from './account-workspace.mjs';
 import {
   confirmOutcomeImport,
   createOutcomeImportWorkflow,
@@ -7,6 +9,12 @@ import {
   refreshAfterOutcomeImport,
   syncOutcomeImportControls
 } from './outcome-import-workflow.mjs';
+import { bindPipelineSnapshotWorkflow, renderPipelineSnapshotTable } from './pipeline-snapshots.mjs';
+import {
+  createOutcomeExportWorkflow,
+  monthlyOutcomeRecords,
+  monthlyOutcomesSnapshotHash
+} from './outcome-export-workflow.mjs';
 
 const $ = selector => document.querySelector(selector);
 const laneNames = { next: 'Next up', doing: 'In progress', waiting: 'Waiting', done: 'Completed' };
@@ -14,6 +22,7 @@ const viewNames = {
   setup: 'Workspace setup',
   ask: 'Ask Esquie',
   board: 'Task board',
+  'completed-work': 'Completed work',
   drafts: 'Draft Studio',
   links: 'Links',
   activity: 'Activity',
@@ -21,13 +30,22 @@ const viewNames = {
   pipeline: 'Pipeline',
   outcomes: 'Monthly Outcomes',
   portfolio: 'Accounts',
+  ssps: 'Local SSP directory',
+  heatmap: 'Accounts Heatmap — local metric matrix',
   demo: 'Create Demo'
 };
+const workViews = new Set(['setup', 'ask', 'board', 'completed-work', 'drafts', 'demo', 'links', 'activity', 'operations']);
+const portfolioViews = new Set(['portfolio', 'ssps', 'heatmap']);
+const outcomeViews = new Set(['all', 'workshops', 'outcomes', 'engagements', 'ahead', 'suggestions', 'impact', 'reporting']);
+let lastWorkView = 'board';
+let currentView = 'board';
 
-let workspace = { tasks: [], drafts: [], activity: [] };
+let workspace = { tasks: [], drafts: [], activity: [], pipelineSnapshots: [] };
 const accountNoteDrafts = new Map();
 const pendingAccountNotes = new Set();
 const expandedAccountHistories = new Set();
+let accountMetricWorkflow = null;
+let sspDirectory = null;
 let editingId = null;
 let importingSource = null;
 let sourceSettingsRendered = false;
@@ -36,6 +54,15 @@ let outlookMessageId = '';
 let outlookSourcePreview = null;
 let outlookSubmitting = false;
 let meetingListAttempt = null;
+let selectedMeetingInsight = null;
+let meetingInsightDetailAttempt = null;
+let genericQueueAttempt = null;
+let genericQueueStorageProblem = false;
+const genericQueueStorageKey = 'esquie-generic-queue-request-v1';
+const genericQueueKinds = new Set(['task_summary', 'document', 'word_document', 'backup', 'meeting_notes', 'source_refresh']);
+const queueStates = new Set(['queued', 'running', 'completed', 'partial', 'failed', 'interrupted']);
+const terminalQueueStates = new Set(['completed', 'partial', 'failed', 'interrupted']);
+const queueUuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const outlookSourceRecheckMessage = 'This historical preview cannot create a reply draft: its source-result revision is missing or invalid. Run a new bounded source check in Operations, then select the new mail preview in Activity. Your unsaved reply text is retained; copy it somewhere safe before clearing it to switch previews. No manual-ID fallback will be used.';
 const taskSourceRecheckMessage = 'This historical preview cannot create a task: its source-result revision is missing or invalid. Run a new bounded source check in Operations, then explicitly select its preview in Activity. Entered task text is retained; no manual-task fallback will be used.';
 let editingDraftId = null;
@@ -130,9 +157,8 @@ async function saveLocalForm(form, { path, method, body, validate, accept, succe
   status.textContent = 'Saving the submitted version locally. No automatic retry.';
   let unlock = lockLocalForm(form);
   let saved = false;
-  let rejected = false;
   try {
-    const result = await api(path, { method, body: JSON.stringify(body) }, response => { rejected = response.status >= 400 && response.status < 500; });
+    const result = await api(path, { method, body: JSON.stringify(body) });
     validate?.(result);
     saved = true;
     const unchanged = snapshot === localFormSnapshot(form);
@@ -150,6 +176,7 @@ async function saveLocalForm(form, { path, method, body, validate, accept, succe
     status.textContent = message;
     showNotice(message);
   } catch (error) {
+    const rejected = error?.definitiveRejection === true;
     operation.blocked = saved || !rejected;
     status.textContent = saved
       ? 'The save succeeded, but the editor could not update. Reload and check saved records before another save; your text is retained.'
@@ -389,10 +416,13 @@ function renderTasks() {
   const host = $('#task-list');
   const focusedControl = document.activeElement?.dataset?.taskControl;
   const focusedTask = document.activeElement?.closest?.('.task-card')?.dataset.taskId;
-  const query = $('#task-search').value.trim().toLocaleLowerCase();
+  const rawQuery = $('#task-search').value;
+  const query = rawQuery.trim().toLocaleLowerCase();
   const showDone = $('#show-done').checked;
   const accountFilter = $('#task-account-filter').value;
   renderAccountOptions($('#task-account-filter'), accountFilter, true);
+  $('#completed-work-search').value = rawQuery;
+  $('#completed-work-account-filter').value = accountFilter;
   const matching = matchingTasks(workspace.tasks, workspace.conversations || [], query, showDone, accountFilter);
   const openCount = workspace.tasks.filter(task => task.status !== 'done').length;
   $('#open-count').textContent = String(openCount);
@@ -435,6 +465,80 @@ function renderTasks() {
     const control = [...(card?.querySelectorAll('[data-task-control]') || [])].find(item => item.dataset.taskControl === focusedControl);
     control?.focus({ preventScroll: true });
   }
+  renderCompletedWork();
+}
+
+function renderCompletedWork() {
+  const host = $('#completed-work-list');
+  const status = $('#completed-work-status');
+  const period = $('#completed-work-period').value || 'all';
+  const accountFilter = $('#completed-work-account-filter').value;
+  renderAccountOptions($('#completed-work-account-filter'), accountFilter, true);
+  const result = completedWorkTasks(
+    workspace.tasks || [], workspace.conversations || [], $('#completed-work-search').value,
+    accountFilter, period, workspace.profile?.timezone
+  );
+  host.replaceChildren();
+  if (!result.available) {
+    status.textContent = `Unavailable: ${result.reason}`;
+    return;
+  }
+  status.textContent = `${result.tasks.length} ${result.tasks.length === 1 ? 'completed task' : 'completed tasks'} · recorded work only; no impact or task type is inferred.`;
+  if (!result.tasks.length) {
+    host.append(makeElement('p', 'empty-lane', 'No currently completed tasks match these filters.'));
+    return;
+  }
+  const accounts = localAccounts();
+  const table = makeElement('table', 'completed-work-table');
+  const caption = makeElement('caption', '', 'Currently completed local tasks. Reopened tasks are not included.');
+  table.append(caption);
+  const header = makeElement('thead');
+  const headerRow = makeElement('tr');
+  for (const label of ['Completed work', 'Local account ID', 'Created (UTC)', 'Completed (UTC)', 'Inert evidence']) {
+    const cell = makeElement('th', '', label);
+    cell.scope = 'col';
+    headerRow.append(cell);
+  }
+  header.append(headerRow);
+  table.append(header);
+  const body = makeElement('tbody');
+  for (const task of result.tasks) {
+    const row = makeElement('tr');
+    const work = makeElement('th', '', '');
+    work.scope = 'row';
+    work.append(makeElement('strong', '', task.title));
+    if (task.details) work.append(makeElement('p', '', task.details));
+    const account = accounts.find(item => item.id === task.accountId);
+    const accountText = task.accountId
+      ? `${account ? account.title : 'Unavailable local account'} [${task.accountId}]`
+      : 'Unassigned';
+    row.append(work, makeElement('td', '', accountText));
+    row.append(makeElement('td', '', recordedTimestamp(task.createdAt) || 'Unknown (missing or invalid creation time)'));
+    row.append(makeElement('td', '', recordedTimestamp(task.completedAt) || 'Unknown (missing or invalid completion time)'));
+    const evidenceCell = makeElement('td', '', '');
+    if (!task.evidence?.length) evidenceCell.textContent = 'No recorded evidence';
+    else {
+      const evidenceList = makeElement('ul', 'completed-work-evidence');
+      for (const evidence of task.evidence) {
+        const item = makeElement('li');
+        item.append(makeElement('strong', '', typeof evidence.title === 'string' && evidence.title ? evidence.title : 'Untitled evidence'));
+        if (typeof evidence.note === 'string' && evidence.note) item.append(makeElement('span', '', ` — ${evidence.note}`));
+        if (typeof evidence.url === 'string' && evidence.url) item.append(makeElement('span', 'muted', ` · ${evidence.url}`));
+        const provenance = evidence.provenance === 'owner-provided-unverified'
+          ? 'Owner-provided · unverified'
+          : evidence.provenance === 'authorized-source-untrusted-evidence'
+            ? 'Authorized-source evidence · untrusted and unverified'
+            : 'Provenance unrecorded · unverified';
+        item.append(makeElement('span', 'muted', ` · ${provenance}`));
+        evidenceList.append(item);
+      }
+      evidenceCell.append(evidenceList);
+    }
+    row.append(evidenceCell);
+    body.append(row);
+  }
+  table.append(body);
+  host.append(table);
 }
 
 function renderTask(task) {
@@ -594,6 +698,40 @@ function renderProfile() {
   }
 }
 
+function currentInsightListItem(job, item) {
+  const connection = latestConnections?.microsoft365;
+  const meetingId = job?.payload?.meetingId;
+  return Boolean(connection?.state === 'connected' && connection.verifiedOwner &&
+    workspace.jobs?.includes(job) &&
+    connection.listSelectionEpoch && job?.kind === 'meeting_insight_list' && job.status === 'partial' &&
+    job.payload?.connectionEpoch === connection.listSelectionEpoch &&
+    connection.listAuthorizationReference &&
+    job.payload?.authorizationReference === connection.listAuthorizationReference &&
+    job.payload?.ownerReference === JSON.stringify(connection.identity) &&
+    JSON.stringify(workspace.sourceConsent?.expectedIdentity) === JSON.stringify(connection.identity) &&
+    workspace.sourceConsent?.sources?.meetingInsightMeetings?.includes(meetingId) &&
+    job.result?.meetingInsightList?.meetingId === meetingId &&
+    item?.meetingId === meetingId && typeof item.id === 'string' && item.id.length <= 2000 &&
+    /^[A-Za-z0-9_+=:@.!-]+$/.test(item.id) && item.id !== '.' && item.id !== '..');
+}
+
+function currentSelectedMeetingInsight() {
+  if (!selectedMeetingInsight) return false;
+  const job = workspace.jobs?.find(item => item.id === selectedMeetingInsight.listJobId);
+  const item = job?.result?.meetingInsightList?.items?.find(item =>
+    item.id === selectedMeetingInsight.insightId && item.meetingId === selectedMeetingInsight.meetingId);
+  return currentInsightListItem(job, item);
+}
+
+function renderMeetingInsightSelection() {
+  const text = $('#meeting-insight-detail-selection');
+  if (!selectedMeetingInsight) {
+    text.textContent = 'No current insight selected. Choose an eligible item from a meeting list below.';
+  } else {
+    text.textContent = `Meeting: ${selectedMeetingInsight.meetingId}\nInsight: ${selectedMeetingInsight.insightId}\nList: ${selectedMeetingInsight.listJobId}${currentSelectedMeetingInsight() ? '' : '\nSelection is stale or unverified; run a new list before requesting detail.'}`;
+  }
+}
+
 function renderJobs() {
   const jobs = workspace.jobs || [];
   const host = $('#job-list');
@@ -617,6 +755,8 @@ function renderJobs() {
     card.append(heading);
     card.append(makeElement('p', 'muted', `Attempt ${job.attempts} · ${formatDate(job.updatedAt)} · ${job.origin === 'schedule' ? 'Opt-in scheduled attempt' : 'Explicit local request'}`));
     if (job.kind === 'meeting_insight_list') card.append(makeElement('p', 'muted', `List request: ${job.requestId} · Meeting: ${job.payload?.meetingId || 'unavailable'}`));
+    if (job.kind === 'meeting_insight_detail') card.append(makeElement('p', 'muted', `Detail request: ${job.requestId} · Meeting: ${job.payload?.meetingId || 'unavailable'} · Insight: ${job.payload?.insightId || 'unavailable'}`));
+    if (job.kind === 'fake_demo') card.append(makeElement('p', 'muted', `Demo request ID: ${job.requestId || 'unknown (legacy)'} · Format: ${job.payload?.format || 'unknown (legacy)'}`));
     if (job.error) card.append(makeElement('p', 'job-error', job.error));
     if (job.result?.text) card.append(makeElement('pre', 'job-result', job.result.text));
     if (job.kind === 'file_content_read' && job.result?.file) {
@@ -668,7 +808,31 @@ function renderJobs() {
       for (const item of list.items) {
         const evidence = makeElement('pre', 'source-excerpt', `Insight ID: ${item.id}\nCreated: ${item.createdDateTime || 'not provided'}\nEnded: ${item.endDateTime || 'not provided'}`);
         card.append(evidence);
+        if (currentInsightListItem(job, item)) {
+          const choose = makeElement('button', 'button', 'Select this insight for separate approval');
+          choose.type = 'button';
+          choose.addEventListener('click', () => {
+            if (meetingInsightDetailAttempt) {
+              showNotice('Resolve the pending or uncertain detail request before changing selection.', true);
+              return;
+            }
+            if (!currentInsightListItem(job, item)) {
+              showNotice('This list selection is stale. Run a new list.', true);
+              return;
+            }
+            selectedMeetingInsight = { listJobId: job.id, meetingId: item.meetingId, insightId: item.id };
+            $('#meeting-insight-detail-form').elements.detailConsent.checked = false;
+            renderMeetingInsightSelection();
+            $('#meeting-insight-detail-status').textContent = 'Selected locally. No detail read or consent has occurred.';
+          });
+          card.append(choose);
+        }
       }
+    }
+    if (job.result?.meetingInsightDetail) {
+      const { item, coverage } = job.result.meetingInsightDetail;
+      card.append(makeElement('p', 'muted', `Untrusted detail preview · ${coverage.status}${item.excerptTruncated ? ' · excerpt truncated at 600 characters' : ''}`));
+      card.append(makeElement('pre', 'source-excerpt', item.excerpt || 'No detail text returned.'));
     }
     if (job.result?.sources) {
       for (const source of job.result.sources) {
@@ -759,7 +923,9 @@ function renderJobs() {
         card.append(section);
       }
     }
-    if (job.kind !== 'meeting_insight_list' && ['failed', 'partial', 'interrupted'].includes(job.status) &&
+    if (job.kind === 'fake_demo' && ['failed', 'partial', 'interrupted'].includes(job.status)) {
+      card.append(makeElement('p', 'muted', 'A demo attempt cannot be retried. Review local approvals and explicitly request a fresh fake-only demo using the form.'));
+    } else if (!['meeting_insight_list', 'meeting_insight_detail'].includes(job.kind) && ['failed', 'partial', 'interrupted'].includes(job.status) &&
         !(job.kind === 'file_content_read' && job.status === 'partial')) {
       const retry = makeElement('button', 'button', 'Explicitly retry');
       retry.type = 'button';
@@ -779,6 +945,7 @@ function renderJobs() {
     }
     host.append(card);
   }
+  renderMeetingInsightSelection();
   const documents = $('#document-list');
   documents.replaceChildren();
   if (!workspace.documents?.length) documents.append(makeElement('p', 'empty-lane', 'No local documents created.'));
@@ -787,7 +954,13 @@ function renderJobs() {
       documents.append(makeElement('p', 'muted', `${document.title} · ${document.fileUnavailableReason}`));
       continue;
     }
-    const button = makeElement('button', 'button', `${document.title} · ${formatDate(document.createdAt)}`);
+    const format = document.format || 'markdown';
+    if (document.format === 'xlsx') {
+      documents.append(makeElement('p', 'muted', `${document.title} · ${document.fileName} · saved only in the approved local Documents folder`));
+      continue;
+    }
+    const formatName = { docx: 'Word (.docx)', pptx: 'PowerPoint (.pptx)', markdown: 'Markdown (.md)' }[format] || 'Unsupported format';
+    const button = makeElement('button', 'button', `${document.title} · ${formatName} · ${formatDate(document.createdAt)}`);
     button.addEventListener('click', async () => {
       try {
         const result = await api(`/api/documents/${document.id}`);
@@ -835,8 +1008,20 @@ function renderBackups() {
   for (const recovery of workspace.recoveries) recoveries.append(makeElement('p', 'muted', recovery.fileUnavailableReason || `${recovery.message} Recovered directory: ${recovery.directory}`));
 }
 
+function syncOutcomeNavigation() {
+  const filter = $('#outcome-view-filter').value || 'all';
+  document.querySelectorAll('[data-outcome-view]').forEach(button => {
+    const selected = button.dataset.outcomeView === filter;
+    button.classList.toggle('selected', selected);
+    button.setAttribute('aria-pressed', String(selected));
+  });
+}
+
 function renderRecords() {
   const allRecords = workspace.records || [];
+  sspDirectory?.render();
+  accountMetricWorkflow?.render(allRecords);
+  renderMetricMatrix({ document, host: $('#account-heatmap'), records: allRecords, formatDate });
   const accountRecords = allRecords.filter(record => record.category === 'account');
   const matchingAccounts = renderAccountRecords({
     document,
@@ -863,15 +1048,79 @@ function renderRecords() {
   const outcomeHost = $('#outcome-list');
   outcomeHost.replaceChildren();
   const outcomes = allRecords.filter(record => ['outcome', 'engagement'].includes(record.category));
-  if (!outcomes.length) outcomeHost.append(makeElement('p', 'empty-lane', 'No owner-provided entries yet.'));
-  for (const record of outcomes) {
+  const filter = $('#outcome-view-filter').value || 'all';
+  syncOutcomeNavigation();
+  const query = $('#outcome-search').value.trim().toLocaleLowerCase();
+  const ownerTimezone = workspace.profile?.timezone;
+  const todayKey = ownerLocalDateKey(new Date(), ownerTimezone);
+  const timezoneTitle = typeof ownerTimezone === 'string' && ownerTimezone.trim() ? 'Timezone invalid' : 'Timezone required';
+  const timezoneUnavailable = typeof ownerTimezone !== 'string' || !ownerTimezone.trim()
+    ? "What's ahead is unavailable: set a valid owner timezone in Operations to establish the date boundary. This view does not use the device timezone."
+    : todayKey ? null
+      : "What's ahead is unavailable: the saved owner timezone is invalid. Update it in Operations; the device timezone is not used.";
+  const unavailableViews = {
+    suggestions: 'Suggested wins are unavailable. This workspace has no source-backed outcomes, opportunity correlation, or approved reporting model; no suggestions are generated.',
+    impact: 'Workshop impact analysis is unavailable. No customer impact, metrics, or causal relationship is inferred from owner-supplied workshop records.',
+    reporting: 'Business reporting is unavailable. No MSX or Power BI data has been queried, and no reporting results are shown.'
+  };
+  const unavailable = unavailableViews[filter] || (filter === 'ahead' ? timezoneUnavailable : null);
+  const unavailableHost = $('#outcome-view-unavailable');
+  unavailableHost.hidden = !unavailable;
+  unavailableHost.replaceChildren();
+  const viewNote = $('#outcome-view-note');
+  viewNote.hidden = filter !== 'ahead' || Boolean(unavailable);
+  viewNote.textContent = filter === 'ahead'
+    ? 'This view uses only saved dates after today in your profile timezone. It does not infer delivery, commitment, customer wins or account relationships; undated entries remain unknown.'
+    : '';
+  if (unavailable) {
+    unavailableHost.append(makeElement('span', 'tag', 'UNAVAILABLE'));
+    unavailableHost.append(makeElement('h2', '', filter === 'ahead' ? timezoneTitle : unavailable.split('.')[0]));
+    unavailableHost.append(makeElement('p', '', unavailable));
+  }
+  const isWorkshop = record => record.workshopImport && typeof record.workshopImport === 'object';
+  const viewRecords = unavailable ? [] : outcomes.filter(record => {
+    if (filter === 'workshops' && !isWorkshop(record)) return false;
+    if (filter === 'outcomes' && (record.category !== 'outcome' || isWorkshop(record))) return false;
+    if (filter === 'engagements' && record.category !== 'engagement') return false;
+    if (filter === 'ahead' && !(typeof record.date === 'string' &&
+        /^\d{4}-\d{2}-\d{2}$/.test(record.date) && record.date > todayKey)) return false;
+    const searchable = [
+      record.title, record.note, record.date, record.category, record.sourceUrl,
+      record.provenance, record.workshopImport?.account, record.workshopImport?.workshop,
+      record.workshopImport?.status
+    ].filter(value => typeof value === 'string').join('\n').toLocaleLowerCase();
+    return !query || searchable.includes(query);
+  });
+  $('#outcome-count').textContent = unavailable
+    ? 'No local records are represented by this unavailable view.'
+    : `${viewRecords.length} matching owner-supplied local ${viewRecords.length === 1 ? 'entry' : 'entries'} (unverified); ${outcomes.length} total in this workspace.`;
+  if (!unavailable && !viewRecords.length) {
+    outcomeHost.append(makeElement('p', 'empty-lane', query
+      ? 'No owner-supplied local entries match this search and view.'
+      : 'No owner-supplied local entries match this view. Missing dates and statuses remain unknown.'));
+  }
+  for (const record of viewRecords) {
     const card = makeElement('article', 'surface draft-card');
       const provenance = {
         'owner-pasted-unverified': 'Owner-pasted, unverified',
         'owner-stated-screenshot-ocr-unverified': 'Owner-stated screenshot OCR, unverified',
         'owner-stated-screenshot-ocr-edited-unverified': 'Owner-stated screenshot OCR, possibly edited, unverified'
       }[record.provenance] || 'Owner-provided, unverified';
-      card.append(makeElement('strong', '', record.title), makeElement('small', '', `${record.category} · ${record.date || 'No date'} · ${provenance}`));
+      const dateLabel = typeof record.date === 'string' && record.date
+        ? `Date: ${record.date}`
+        : 'Date unknown (not provided)';
+      const statusLabel = isWorkshop(record)
+        ? `Owner-provided workshop status: ${typeof record.workshopImport.status === 'string' && record.workshopImport.status
+          ? record.workshopImport.status : 'unknown (not provided)'}`
+        : 'Status unknown (not recorded)';
+      card.append(makeElement('strong', '', record.title));
+      card.append(makeElement('small', '', `${record.category === 'engagement' ? 'Strategic engagement' : isWorkshop(record) ? 'Workshop import' : 'Owner-entered outcome'} · ${dateLabel} · ${provenance}`));
+      if (isWorkshop(record)) {
+        card.append(makeElement('small', '', `Owner-provided workshop account label: ${record.workshopImport.account || 'not provided'} · Workshop: ${record.workshopImport.workshop || 'not provided'} · ${statusLabel}`));
+      } else {
+        card.append(makeElement('small', '', statusLabel));
+      }
+      card.append(makeElement('small', 'muted', `Local record ID: ${record.id}`));
       if (record.note) card.append(makeElement('p', '', record.note));
       if (record.sourceUrl) {
         const href = inertHttpUrl(record.sourceUrl);
@@ -949,6 +1198,153 @@ function resetAccountForm() {
 
 let accountFormBaseline = null;
 let accountSubmission = null;
+
+const pipelineSnapshotForm = $('#pipeline-snapshot-form');
+const pipelineSnapshotType = pipelineSnapshotForm.elements.type;
+const pipelineSnapshotText = pipelineSnapshotForm.elements.text;
+const pipelineSnapshotReview = pipelineSnapshotForm.elements.reviewed;
+const pipelineSnapshotPreviewResult = $('#pipeline-snapshot-preview-result');
+const pipelineViewType = $('#pipeline-view-type');
+const pipelineViewSnapshot = $('#pipeline-view-snapshot');
+const pipelineSearch = $('#pipeline-search');
+const pipelineFilterColumn = $('#pipeline-filter-column');
+const pipelineFilterValue = $('#pipeline-filter-value');
+const pipelineSortColumn = $('#pipeline-sort-column');
+const pipelineSortDirection = $('#pipeline-sort-direction');
+const pipelineSnapshotMeta = $('#pipeline-snapshot-meta');
+const pipelineSnapshotTable = $('#pipeline-snapshot-table');
+
+function renderPipelinePreview({ preview, uncertain, abandoned, reviewed }) {
+  pipelineSnapshotPreviewResult.replaceChildren();
+  const displayPreview = uncertain?.preview || preview;
+  const isUncertain = Boolean(uncertain);
+  $('#pipeline-snapshot-uncertain-resolution').hidden = !isUncertain;
+  $('#pipeline-snapshot-review-row').hidden = !preview || isUncertain || Boolean(preview.duplicateSnapshotId);
+  pipelineSnapshotReview.checked = reviewed && !isUncertain && !preview?.duplicateSnapshotId;
+  pipelineSnapshotReview.disabled = !preview || isUncertain || Boolean(preview.duplicateSnapshotId);
+  if (abandoned) {
+    pipelineSnapshotPreviewResult.append(makeElement('p', 'job-error',
+      'A prior confirmation remains unresolved and may still have saved. Its retry was abandoned only in this tab. The pasted table is retained; any new save requires a separate preview and confirmation.'));
+  }
+  if (isUncertain) {
+    pipelineSnapshotPreviewResult.append(makeElement('p', 'job-error',
+      'Confirmation result is uncertain; this snapshot may already have been saved. Retry sends this same reviewed table with the same request ID. To stop retrying, refresh the saved list and explicitly resolve this request as already saved only if you find the exact table.'));
+  }
+  if (!displayPreview) return;
+  if (displayPreview.duplicateSnapshotId) {
+    pipelineSnapshotPreviewResult.append(makeElement('p', 'muted', 'An identical snapshot of this type is already saved. No duplicate will be added.'));
+  } else if (!isUncertain) {
+    pipelineSnapshotPreviewResult.append(makeElement('p', 'muted',
+      `${displayPreview.rows.length} rows · ${displayPreview.headers.length} owner-supplied columns · ${displayPreview.snapshotCount} of ${displayPreview.limit} snapshots retained`));
+  }
+  const tableHost = makeElement('div', 'pipeline-table-wrap');
+  renderPipelineSnapshotTable(document, tableHost, displayPreview, {
+    caption: isUncertain
+      ? 'Previously reviewed confirmation; outcome is uncertain. Check saved snapshots before a new confirmation.'
+      : 'Preview only. Owner-pasted, unverified values; nothing has been saved.'
+  });
+  pipelineSnapshotPreviewResult.append(tableHost);
+}
+
+function replacePipelineColumnOptions(select, headers, previousValue, includeOriginal = false) {
+  select.replaceChildren();
+  if (includeOriginal) {
+    const option = makeElement('option', '', 'Original row order');
+    option.value = '-1';
+    select.append(option);
+  } else {
+    const option = makeElement('option', '', 'All columns');
+    option.value = '-1';
+    select.append(option);
+  }
+  for (const [index, header] of headers.entries()) {
+    const option = makeElement('option', '', header);
+    option.value = String(index);
+    select.append(option);
+  }
+  select.value = headers.some((_, index) => String(index) === previousValue) ? previousValue : '-1';
+}
+
+function renderPipeline() {
+  const allSnapshots = workspace.pipelineSnapshots || [];
+  const type = pipelineViewType.value || 'opportunities';
+  const snapshots = allSnapshots.filter(snapshot => snapshot.type === type);
+  const requestedId = pipelineViewSnapshot.value;
+  const selected = snapshots.find(snapshot => snapshot.id === requestedId) || snapshots[0] || null;
+
+  pipelineViewSnapshot.replaceChildren();
+  if (!selected) {
+    const option = makeElement('option', '', 'No saved snapshots');
+    option.value = '';
+    pipelineViewSnapshot.append(option);
+    pipelineSnapshotMeta.textContent = 'No owner-pasted snapshots of this type have been saved.';
+    pipelineSnapshotTable.replaceChildren(makeElement('p', 'muted', 'Preview and explicitly save a local table to begin.'));
+    replacePipelineColumnOptions(pipelineFilterColumn, [], '-1');
+    replacePipelineColumnOptions(pipelineSortColumn, [], '-1', true);
+    return;
+  }
+
+  for (const snapshot of snapshots) {
+    const option = makeElement('option', '', `${formatDate(snapshot.createdAt) || 'Unknown date'} · ${snapshot.rows.length} rows`);
+    option.value = snapshot.id;
+    pipelineViewSnapshot.append(option);
+  }
+  pipelineViewSnapshot.value = selected.id;
+  const previousFilter = pipelineFilterColumn.value;
+  const previousSort = pipelineSortColumn.value;
+  replacePipelineColumnOptions(pipelineFilterColumn, selected.headers, previousFilter);
+  replacePipelineColumnOptions(pipelineSortColumn, selected.headers, previousSort, true);
+  pipelineSnapshotMeta.textContent =
+    `${selected.type === 'opportunities' ? 'Opportunities' : 'Milestones'} · ${formatDate(selected.createdAt) || 'Unknown date'} · Owner-pasted, unverified · ${selected.rows.length} rows`;
+  renderPipelineSnapshotTable(document, pipelineSnapshotTable, selected, {
+    search: pipelineSearch.value,
+    filterIndex: Number(pipelineFilterColumn.value),
+    filterValue: pipelineFilterValue.value,
+    sortIndex: Number(pipelineSortColumn.value),
+    direction: pipelineSortDirection.value,
+    caption: `Owner-pasted, unverified ${selected.type} snapshot. Values are displayed as text only.`
+  });
+}
+
+bindPipelineSnapshotWorkflow({
+  form: pipelineSnapshotForm,
+  typeInput: pipelineSnapshotType,
+  textInput: pipelineSnapshotText,
+  reviewInput: pipelineSnapshotReview,
+  previewButton: $('#pipeline-snapshot-preview'),
+  discardButton: $('#pipeline-snapshot-discard'),
+  confirmButton: $('#pipeline-snapshot-confirm'),
+  refreshSavedButton: $('#pipeline-snapshot-refresh-saved'),
+  resolveSavedInput: $('#pipeline-snapshot-resolve-saved-check'),
+  resolveSavedButton: $('#pipeline-snapshot-resolve-saved'),
+  abandonSavedInput: $('#pipeline-snapshot-abandon-check'),
+  abandonSavedButton: $('#pipeline-snapshot-abandon'),
+  request: api,
+  renderPreview: renderPipelinePreview,
+  onNotice: (message, error = false) => showNotice(message, error),
+  onSaved: async result => {
+    pipelineViewType.value = result.snapshot.type;
+    pipelineViewSnapshot.value = result.snapshot.id;
+    await refreshState();
+    showNotice(result.deduplicated
+      ? 'The prior local snapshot save was confirmed; no second snapshot was added.'
+      : 'Owner-reviewed snapshot saved locally and retained.');
+  },
+  onRefreshSaved: async type => {
+    pipelineViewType.value = type;
+    pipelineViewSnapshot.value = '';
+    await refreshState();
+  }
+});
+
+pipelineViewType.addEventListener('change', () => {
+  pipelineViewSnapshot.value = '';
+  renderPipeline();
+});
+pipelineViewSnapshot.addEventListener('change', renderPipeline);
+for (const control of [pipelineSearch, pipelineFilterColumn, pipelineFilterValue, pipelineSortColumn, pipelineSortDirection]) {
+  control.addEventListener(control === pipelineSearch || control === pipelineFilterValue ? 'input' : 'change', renderPipeline);
+}
 
 const outcomeImportWorkflow = createOutcomeImportWorkflow();
 const outcomeImportForm = $('#outcome-import-form');
@@ -1192,6 +1588,155 @@ outcomeImportConfirm.addEventListener('click', async () => {
   }
 });
 
+const outcomeExportWorkflow = createOutcomeExportWorkflow();
+const outcomeExportButton = $('#outcome-export');
+const outcomeExportRetry = $('#outcome-export-retry');
+const outcomeExportReset = $('#outcome-export-reset');
+const outcomeExportStatus = $('#outcome-export-status');
+let outcomeExportRefreshBlocked = false;
+let outcomeExportInspecting = false;
+
+function renderOutcomeExportControls() {
+  const state = outcomeExportWorkflow.snapshot();
+  outcomeExportButton.disabled = state.busy || outcomeExportInspecting || state.uncertain || !state.storageReady || outcomeExportRefreshBlocked;
+  outcomeExportRetry.hidden = !state.uncertain;
+  outcomeExportRetry.disabled = state.busy || outcomeExportInspecting || !state.requestId || !state.retryIntentAvailable;
+  outcomeExportReset.hidden = !state.uncertain;
+  outcomeExportReset.disabled = state.busy || outcomeExportInspecting || !state.requestId;
+  if (!state.storageReady && !state.requestId) {
+    outcomeExportStatus.textContent = 'Persistent local request tracking is unavailable. New exports are disabled; no workbook was requested.';
+  } else if (state.uncertain && state.requestId && !state.retryIntentAvailable) {
+    outcomeExportStatus.textContent = 'The original export intent is unavailable (no saved snapshot hash and record count). Retry is disabled; inspect Documents and Activity, then resolve this request explicitly.';
+  } else if (state.uncertain && !state.requestId) {
+    outcomeExportStatus.textContent = 'The saved browser request marker is unreadable. Export and retry are blocked; preserve local Documents and Activity while resolving the marker.';
+  } else if (state.uncertain && !outcomeExportStatus.textContent) {
+    outcomeExportStatus.textContent = 'An earlier request may have completed. Check Documents and Activity before retrying or allowing a new request.';
+  }
+}
+
+async function submitOutcomeExport(retryExisting = false) {
+  let ticket;
+  try {
+    const records = monthlyOutcomeRecords(workspace?.records || []);
+    const snapshotHash = await monthlyOutcomesSnapshotHash(records);
+    ticket = outcomeExportWorkflow.begin({
+      snapshotHash,
+      recordCount: records.length,
+      retryExisting
+    });
+    if (!ticket) {
+      showNotice('An export is already running or needs explicit owner review. No new request was made.', true);
+      return;
+    }
+    outcomeExportStatus.textContent = retryExisting
+      ? 'Checking the existing request ID. This will not replace or create a second workbook for an identical request.'
+      : 'Preparing a local-only XLSX workbook. No cloud source was read.';
+    renderOutcomeExportControls();
+    const result = await api('/api/outcomes/export', {
+      method: 'POST',
+      body: JSON.stringify({
+        requestId: ticket.requestId,
+        snapshotHash: ticket.snapshotHash,
+        recordCount: ticket.recordCount
+      })
+    });
+    const completion = outcomeExportWorkflow.complete(ticket, result);
+    if (completion.status === 'unknown') {
+      outcomeExportStatus.textContent = `${completion.message} No automatic retry was made.`;
+      try { await refreshState(); }
+      catch (error) { outcomeExportStatus.textContent += ` Workspace refresh also failed: ${error.message}`; }
+      renderOutcomeExportControls();
+      showNotice('The export outcome is unknown. Check the local Documents list and Activity before retrying or resetting the request.', true);
+      return;
+    }
+    if (completion.status === 'completed-needs-inspection') {
+      outcomeExportRefreshBlocked = true;
+      outcomeExportStatus.textContent = `The workbook was saved and verified as ${completion.receipt.fileName}, but its request marker could not be cleared. Check Documents and Activity before allowing a new request.`;
+      try { await refreshState(); }
+      catch (error) { outcomeExportStatus.textContent += ` Workspace refresh failed: ${error.message}`; }
+      renderOutcomeExportControls();
+      showNotice('The workbook was saved, but request tracking needs owner inspection before another export.', true);
+      return;
+    }
+    try {
+      await refreshState();
+      outcomeExportRefreshBlocked = false;
+      outcomeExportStatus.textContent = `Saved and verified ${completion.receipt.fileName} in the approved local Documents folder. No browser download or cloud write occurred.`;
+      showNotice(`Saved ${completion.receipt.fileName} locally. ${result.reused ? 'The existing verified workbook was reused.' : 'The workbook contains only the requested local record snapshot.'}`);
+    } catch (error) {
+      outcomeExportRefreshBlocked = true;
+      outcomeExportStatus.textContent = `The workbook was saved and verified as ${completion.receipt.fileName}, but workspace refresh failed: ${error.message} Reload and check Documents before starting another export.`;
+      showNotice('The workbook was saved; workspace refresh failed. Reload and check Documents before taking further action.', true);
+    }
+  } catch (error) {
+    if (ticket) {
+      outcomeExportWorkflow.fail(ticket);
+      outcomeExportStatus.textContent = `The export outcome could not be confirmed: ${error.message} No automatic retry was made. Check Documents and Activity before retrying the same request or allowing a new one.`;
+      try { await refreshState(); }
+      catch (refreshError) { outcomeExportStatus.textContent += ` Workspace refresh also failed: ${refreshError.message}`; }
+      showNotice('The export outcome is unknown. Check Documents and Activity before taking further action.', true);
+    } else {
+      outcomeExportStatus.textContent = error.message;
+      showNotice(error.message, true);
+    }
+  } finally {
+    renderOutcomeExportControls();
+  }
+}
+
+outcomeExportButton.addEventListener('click', () => submitOutcomeExport(false));
+outcomeExportRetry.addEventListener('click', () => submitOutcomeExport(true));
+outcomeExportReset.addEventListener('click', async () => {
+  if (!window.confirm('Only continue after checking the Documents list and Activity. This clears the old request marker but does not retry, delete, or change any workbook or outcome.')) return;
+  const requestId = outcomeExportWorkflow.snapshot().requestId;
+  if (!requestId) return;
+  outcomeExportInspecting = true;
+  outcomeExportStatus.textContent = 'Checking whether the existing request is still running or has a saved file.';
+  renderOutcomeExportControls();
+  try {
+    const inspection = await api('/api/outcomes/export/status', {
+      method: 'POST', body: JSON.stringify({ requestId })
+    });
+    if (inspection.status === 'running') {
+      outcomeExportStatus.textContent = 'The original request is still running. Its ID was retained; wait, refresh Documents and Activity, then inspect again.';
+      showNotice('The original export is still running. No new request ID was allowed.', true);
+      return;
+    }
+    if (!['committed', 'absent', 'interrupted', 'untracked', 'unverified'].includes(inspection.status)) {
+      throw new Error('The saved export state could not be classified; the request marker was retained.');
+    }
+    if (inspection.status === 'untracked' &&
+        !window.confirm(`A file named ${inspection.fileName} exists without a verified saved receipt. Inspect it in the local Documents folder before allowing a new request.`)) return;
+    if (inspection.status === 'unverified' &&
+        !window.confirm(`The existing ${inspection.fileName || 'workbook'} could not be verified. Only clear the request marker if you have manually inspected the local file and Activity.`)) return;
+    const resolution = await api('/api/outcomes/export/resolve', {
+      method: 'POST', body: JSON.stringify({ requestId, inspected: true })
+    });
+    if (resolution.resolved !== true || resolution.inspection?.status !== inspection.status) {
+      throw new Error('The server could not confirm resolution of this request; its local marker was retained.');
+    }
+    if (!outcomeExportWorkflow.abandonAfterInspection(true, true)) {
+      throw new Error('The unresolved request marker could not be cleared.');
+    }
+    outcomeExportRefreshBlocked = false;
+    outcomeExportStatus.textContent = inspection.status === 'committed'
+      ? `A verified workbook already exists as ${inspection.export.fileName}. The old marker was cleared after inspection; any later export is a separate explicit request.`
+      : inspection.status === 'absent'
+        ? 'No active request or saved workbook was found. The old marker was cleared; a new export still requires a separate explicit action.'
+        : inspection.status === 'interrupted'
+          ? 'The request did not leave a verified workbook receipt. The marker was cleared after inspection; no export was retried or started.'
+        : `The prior file ${inspection.fileName} was preserved. The old marker was cleared after your additional inspection; any later export is a separate explicit request.`;
+    showNotice('The old request marker was cleared after inspection. No export was retried or started.');
+  } catch (error) {
+    outcomeExportStatus.textContent = `${error.message} No new export request was made.`;
+    showNotice(error.message, true);
+  } finally {
+    outcomeExportInspecting = false;
+    renderOutcomeExportControls();
+  }
+});
+renderOutcomeExportControls();
+
 const setupTitles = ['Your profile', 'Manager and people', 'Account portfolio', 'Workspace', 'Writing style', 'Monthly outcomes', 'Source configuration', 'Review'];
 
 function renderSetup(force = false) {
@@ -1282,25 +1827,37 @@ function renderDraftOperations() {
 }
 
 function conversationBusy() {
-  return localFormBusy($('#conversation-form')) || localFormBusy($('#evidence-form'));
+  if (genericQueueAttempt?.body.taskId && ['pending', 'inspecting', 'verifying-inputs'].includes(genericQueueAttempt.phase)) {
+    showNotice('Inspect the original task queue request in Activity before changing or closing its target.', true);
+    return true;
+  }
+  return localFormBusy($('#task-owner-form')) || localFormBusy($('#conversation-form')) || localFormBusy($('#evidence-form'));
 }
 
+let taskOwnerBaseline = '';
+let taskOwnerRevision = null;
+
 function conversationHasText() {
-  return [$('#conversation-form'), $('#evidence-form')].some(form =>
-    [...form.elements].some(control => control.name && control.value));
+  return $('#task-owner-form').elements.nextOwner.value !== taskOwnerBaseline ||
+    [$('#conversation-form'), $('#evidence-form')].some(form =>
+    [...form.elements].some(control => control.name && (control.name === 'type' ? control.value !== 'email' : control.value)));
 }
 
 async function openConversation(task) {
   if (conversationBusy()) return;
   if (conversationTaskId !== task.id && conversationHasText()) {
-    showNotice('Task not changed. Copy and clear the unsaved note/evidence before switching tasks.', true);
+    showNotice('Task not changed. Copy and clear unsaved task context before switching tasks.', true);
     return;
   }
   if (conversationTaskId !== task.id) {
     conversationTaskId = task.id;
     conversationViewRevision++;
+    taskOwnerBaseline = typeof task.nextOwner === 'string' ? task.nextOwner : '';
+    taskOwnerRevision = task.revision || 0;
+    $('#task-owner-form').elements.nextOwner.value = taskOwnerBaseline;
+    $('#task-owner-current').textContent = `Saved next owner: ${taskOwnerBaseline || 'Unknown'} (owner-entered, unverified)`;
     for (const selector of ['#task-timeline', '#conversation-messages', '#task-evidence']) $(selector).replaceChildren();
-    for (const selector of ['#conversation-form', '#evidence-form']) $(selector).querySelector('[data-save-status]').textContent = '';
+    for (const selector of ['#task-owner-form', '#conversation-form', '#evidence-form']) $(selector).querySelector('[data-save-status]').textContent = '';
   }
   $('#conversation-title').textContent = task.title;
   if (!$('#conversation-dialog').open) $('#conversation-dialog').showModal();
@@ -1329,13 +1886,16 @@ async function renderConversation() {
     timeline.replaceChildren(makeElement('p', 'muted', `Created: ${formatDate(result.createdAt) || 'Unknown; no legacy date was invented.'}`));
     if (!result.history.length) timeline.append(makeElement('p', 'muted', 'No historical transitions were recorded. New changes will appear here.'));
     for (const event of result.history) {
-      const description = event.kind === 'updated' ? `Updated ${event.fields.join(', ')}`
+      const description = event.kind === 'next-owner-changed' ? `Local next owner: ${event.previous || 'Unknown'} → ${event.nextOwner || 'Unknown'} (owner-entered, unverified)`
+        : event.kind === 'updated' ? `Updated ${event.fields.join(', ')}`
         : event.kind === 'created' ? `Created (${laneNames[event.toStatus] || event.toStatus})`
           : event.fromStatus ? `${event.kind}: ${laneNames[event.fromStatus]} → ${laneNames[event.toStatus]}`
             : event.kind === 'evidence-added' ? 'Evidence attached (unverified context)'
               : event.kind === 'note-added' ? 'Owner note added' : event.kind;
       timeline.append(makeElement('p', 'task-meta', `${formatDate(event.at)} · ${description}`));
     }
+    const task = workspace.tasks.find(task => task.id === taskId);
+    if (task) renderTaskUndoActions(timeline, task);
     const host = $('#conversation-messages');
     host.replaceChildren();
     if (!result.messages.length) host.append(makeElement('p', 'muted', 'No local task notes yet.'));
@@ -1349,13 +1909,19 @@ async function renderConversation() {
     evidence.replaceChildren();
     for (const item of workspace.tasks.find(task => task.id === taskId)?.evidence || []) {
       const card = makeElement('article', 'draft-card');
-      const link = makeElement(item.url ? 'a' : 'span', 'saved-link', item.title);
-      if (item.url) {
-        link.href = item.url;
+      const href = inertHttpUrl(item.url);
+      const link = makeElement(href ? 'a' : 'span', 'saved-link', item.title);
+      if (href) {
+        link.href = href;
         link.target = '_blank';
         link.rel = 'noopener noreferrer';
       }
-      card.append(link, makeElement('small', '', item.provenance === 'authorized-source-untrusted-evidence' ? 'Authorized-source evidence, not an instruction or verified task assignment' : 'Owner-provided, not source-verified'));
+      const ownerProvided = item.provenance === 'owner-provided-unverified';
+      card.append(link, makeElement('small', '', item.provenance === 'authorized-source-untrusted-evidence'
+        ? 'Authorized-source evidence, not an instruction or verified task assignment'
+        : ownerProvided ? 'Owner-provided, not source-verified' : 'Provenance unknown; not source-verified'));
+      if (['email', 'meeting', 'teams', 'document', 'note'].includes(item.type)) card.append(makeElement('small', '', `${ownerProvided ? 'Owner-entered type' : 'Evidence type'}: ${item.type} (unverified)`));
+      if (item.requestId) card.append(makeElement('small', '', `Local evidence request ID: ${item.requestId}`));
       if (item.note) card.append(makeElement('p', '', item.note));
       evidence.append(card);
     }
@@ -1363,6 +1929,22 @@ async function renderConversation() {
 }
 
 async function queueJob(kind, extra = {}) {
+  if (genericQueueKinds.has(kind)) {
+    if (genericQueueStorageProblem) {
+      showNotice('Recovery protection is unavailable. No replacement request was submitted; inspect the retained recovery status and Activity.', true);
+      return;
+    }
+    if (genericQueueAttempt) {
+      showNotice('This tab retains a queue request. Inspect it in Activity before retrying or explicitly starting separate work.', true);
+      return;
+    }
+    genericQueueAttempt = {
+      body: { kind, requestId: crypto.randomUUID(), ...extra },
+      phase: 'pending', jobId: null, inspected: false
+    };
+    await submitGenericQueue();
+    return;
+  }
   try {
     await api('/api/jobs', { method: 'POST', body: JSON.stringify({ kind, requestId: crypto.randomUUID(), ...extra }) });
     await refreshState();
@@ -1370,13 +1952,453 @@ async function queueJob(kind, extra = {}) {
   } catch (error) { showNotice(error.message, true); }
 }
 
+const taskUndoRequests = new Map();
+
+function renderTaskUndoActions(host, task) {
+  for (const event of task.history || []) {
+    if (!event.undoReceipt) continue;
+    const operation = taskUndoRequests.get(event.id);
+    const eligible = task.revision === event.undoReceipt.revision &&
+      !(task.history || []).some(item => item.kind === 'undo-applied' && item.eventId === event.id);
+    if (!eligible && !operation) continue;
+    const card = makeElement('div', 'draft-card');
+    const label = event.toStatus === 'done' ? `Undo completion: reopen in ${laneNames[event.fromStatus]}`
+      : event.fromStatus === 'done' ? 'Undo reopening: restore Completed'
+        : `Undo move: restore ${laneNames[event.fromStatus]}`;
+    card.append(makeElement('strong', '', task.title));
+    if (operation) {
+      const status = makeElement('p', 'muted', operation.message);
+      status.setAttribute('role', 'status');
+      card.append(status);
+      if (operation.state === 'unknown') {
+        const check = makeElement('button', 'button', 'Check saved undo outcome (read only)');
+        check.type = 'button';
+        check.dataset.undoCheck = event.id;
+        check.addEventListener('click', async () => {
+          check.disabled = true;
+          try {
+            await refreshState();
+            const applied = workspace.tasks.find(item => item.id === task.id)?.history?.find(item =>
+              item.kind === 'undo-applied' && item.requestId === operation.requestId && item.eventId === event.id &&
+              item.requestRevision === operation.revision && item.appliedRevision === operation.revision + 1);
+            operation.state = applied ? 'applied' : 'unknown';
+            operation.message = applied
+              ? `Undo was recorded at revision ${applied.appliedRevision}. Current task state may include later edits; no request was replayed.`
+              : `Undo outcome remains unknown for request ${operation.requestId}. No matching saved receipt is visible; no retry was sent.`;
+          } catch (error) {
+            operation.message = `Undo outcome remains unknown: ${error.message}. No retry was sent.`;
+          } finally {
+            renderActivity();
+            showNotice(operation.message, operation.state !== 'applied');
+          }
+        });
+        card.append(check);
+      }
+    } else {
+      const button = makeElement('button', 'button', label);
+      button.type = 'button';
+      button.dataset.undoEvent = event.id;
+      const revision = task.revision;
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        button.textContent = 'Undo pending; no reversal confirmed yet.';
+        await requestTaskUndo(task.id, event.id, revision);
+        button.textContent = taskUndoRequests.get(event.id)?.message || 'Inspect Activity for the undo outcome.';
+      });
+      card.append(button);
+    }
+    host.append(card);
+  }
+}
+
+async function requestTaskUndo(taskId, eventId, revision) {
+  if (taskUndoRequests.has(eventId)) return;
+  const operation = {
+    requestId: crypto.randomUUID(), revision, state: 'pending',
+    message: 'Undo is pending. No reversal is claimed until a matching saved receipt is verified.'
+  };
+  taskUndoRequests.set(eventId, operation);
+  renderActivity();
+  let confirmed = false;
+  try {
+    const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/undo`, {
+      method: 'POST', body: JSON.stringify({ eventId, revision, requestId: operation.requestId })
+    }, null, 200);
+    const receipt = result?.undoReceipt;
+    if (receipt?.kind !== 'task-undo' || receipt.status !== 'applied' || receipt.taskId !== taskId ||
+        receipt.eventId !== eventId || receipt.requestId !== operation.requestId ||
+        receipt.requestRevision !== revision || receipt.appliedRevision !== revision + 1 ||
+        typeof receipt.id !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(receipt.id) || result.task?.id !== taskId) {
+      throw new Error('The saved undo receipt did not match the explicit request.');
+    }
+    confirmed = true;
+    operation.state = 'applied';
+    operation.message = `Undo recorded at revision ${receipt.appliedRevision}. Original history, notes and evidence were retained; later task changes are not reversed.`;
+    try { await refreshState(); }
+    catch (error) { operation.message += ` Display refresh failed: ${error.message}. Do not repeat the undo to repair the display.`; }
+    showNotice(operation.message);
+  } catch (error) {
+    const rejected = error?.definitiveRejection === true;
+    operation.state = rejected ? 'rejected' : 'unknown';
+    operation.message = rejected
+      ? `Undo was rejected: ${error.message}. No reversal is claimed; inspect the current task history.`
+      : `Undo outcome is unknown for request ${operation.requestId}: ${error.message}. Check its saved outcome; do not blindly retry.`;
+    showNotice(operation.message, true);
+  } finally {
+    if (confirmed) operation.state = 'applied';
+    renderActivity();
+  }
+}
+
+function genericPayload(body) {
+  return body.kind === 'meeting_notes'
+    ? { notes: body.notes.normalize('NFC').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').trim() } : {};
+}
+
+async function genericFingerprint(body, payload, salt) {
+  const bytes = new TextEncoder().encode(JSON.stringify([salt, body.kind, body.taskId || null, payload]));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function writeGenericQueueRecord(attempt) {
+  try {
+    sessionStorage.setItem(genericQueueStorageKey, JSON.stringify({
+      version: 1, requestId: attempt.body.requestId, kind: attempt.body.kind, taskId: attempt.body.taskId || null,
+      salt: attempt.salt, fingerprint: attempt.fingerprint, jobId: attempt.jobId
+    }));
+    return true;
+  } catch {
+    genericQueueStorageProblem = true;
+    return false;
+  }
+}
+
+function clearGenericQueueRecord() {
+  try {
+    sessionStorage.removeItem(genericQueueStorageKey);
+    return true;
+  } catch {
+    genericQueueStorageProblem = true;
+    return false;
+  }
+}
+
+async function matchingGenericJob(job, attempt) {
+  const body = attempt.body;
+  const matches = job && typeof job.id === 'string' && queueUuid.test(job.id) &&
+    (!attempt.jobId || attempt.jobId === job.id) && job.requestId === body.requestId && job.kind === body.kind &&
+    job.taskId === (body.taskId || null) && queueStates.has(job.status) &&
+    job.payload && typeof job.payload === 'object' && !Array.isArray(job.payload) && (body.kind === 'meeting_notes'
+      ? typeof job.payload.notes === 'string' && Object.keys(job.payload).length === 1 : Object.keys(job.payload).length === 0);
+  return matches && await genericFingerprint(body, job.payload, attempt.salt) === attempt.fingerprint;
+}
+
+function renderGenericQueue(message) {
+  const attempt = genericQueueAttempt;
+  $('#generic-queue-panel').hidden = !attempt && !genericQueueStorageProblem;
+  if (!attempt && !genericQueueStorageProblem) return;
+  const pending = ['pending', 'inspecting', 'refreshing', 'verifying-inputs'].includes(attempt?.phase);
+  const identity = attempt ? `Request ${attempt.body.requestId} (${attempt.body.kind}${attempt.body.taskId ? `, exact task ${attempt.body.taskId}` : ''}): ` : '';
+  $('#generic-queue-status').textContent = identity + message + (genericQueueStorageProblem
+    ? ' Queue recovery storage or fingerprint protection is unavailable or corrupt. Replacement work is blocked. Inspect durable Activity using its navigation; restore recovery storage before reloading. No notes were stored here.' : '');
+  $('#generic-queue-inspect').disabled = pending || !attempt;
+  $('#generic-queue-retry').hidden = genericQueueStorageProblem || attempt?.phase !== 'absent';
+  $('#generic-queue-retry').disabled = pending;
+  $('#generic-queue-new').hidden = genericQueueStorageProblem || !(attempt?.phase === 'rejected' || (attempt?.phase === 'accepted' && attempt.inspected && terminalQueueStates.has(attempt.status)));
+  for (const button of document.querySelectorAll('[data-job]')) {
+    if (genericQueueKinds.has(button.dataset.job)) button.disabled = pending || genericQueueStorageProblem;
+  }
+  $('#summarize-task').disabled = pending || genericQueueStorageProblem;
+  $('#meeting-form button[type="submit"]').disabled = pending || genericQueueStorageProblem;
+  $('#meeting-form').elements.notes.disabled = pending;
+}
+
+async function submitGenericQueue() {
+  const attempt = genericQueueAttempt;
+  attempt.phase = 'pending';
+  attempt.inspected = false;
+  renderGenericQueue('Submitting once. No completed result is claimed; no automatic retry.');
+  try {
+    if (!attempt.fingerprint) {
+      attempt.salt = crypto.randomUUID();
+      attempt.fingerprint = await genericFingerprint(attempt.body, genericPayload(attempt.body), attempt.salt);
+    }
+    if (!writeGenericQueueRecord(attempt)) throw new Error('Recovery storage unavailable.');
+  } catch {
+    genericQueueStorageProblem = true;
+    attempt.phase = 'unknown';
+    renderGenericQueue('This submission was not dispatched because its recovery identity could not be protected.');
+    return;
+  }
+  try {
+    let responseStatus;
+    const receipt = await api('/api/jobs', { method: 'POST', body: JSON.stringify(attempt.body) },
+      response => { responseStatus = response.status; });
+    const expectedStatus = ['queued', 'running'].includes(receipt?.job?.status) ? 202 : 200;
+    if (responseStatus !== expectedStatus || !await matchingGenericJob(receipt?.job, attempt)) throw new Error('Unconfirmed queue receipt.');
+    attempt.jobId = receipt.job.id;
+    attempt.status = receipt.job.status;
+    attempt.phase = 'refreshing';
+    writeGenericQueueRecord(attempt);
+  } catch (error) {
+    const rejected = !attempt.uncertain && error?.definitiveRejection === true;
+    if (!rejected) attempt.uncertain = true;
+    if (rejected) clearGenericQueueRecord();
+    attempt.phase = rejected ? 'rejected' : 'unknown';
+    renderGenericQueue(rejected
+      ? 'Submission rejected. No accepted job is confirmed. Your notes are retained; correct inputs/approvals before explicitly starting separate work.'
+      : 'Submission outcome unknown. Your notes and original task are retained. Inspect Activity before recovery; do not issue a new request ID.');
+    return;
+  }
+  const message = `Accepted local job ${attempt.jobId}; recorded state: ${attempt.status}. Queue acceptance is not a completed result. Inspect Activity and its result before separate work.`;
+  try {
+    await refreshState();
+    attempt.phase = 'accepted';
+    renderGenericQueue(message);
+  } catch {
+    attempt.phase = 'accepted';
+    renderGenericQueue(`${message} Accepted, but display refresh failed; this is not a rejected submission. Do not resubmit it.`);
+  }
+}
+
+$('#generic-queue-inspect').addEventListener('click', async () => {
+  const attempt = genericQueueAttempt;
+  if (!attempt || ['pending', 'inspecting', 'refreshing', 'verifying-inputs'].includes(attempt.phase)) return;
+  const previous = attempt.phase;
+  attempt.phase = 'inspecting';
+  attempt.inspected = false;
+  renderGenericQueue('Checking the local Activity job records only. No work is resubmitted.');
+  try {
+    const result = await api('/api/jobs');
+    if (!Array.isArray(result?.jobs)) throw new Error('Invalid Activity response.');
+    const matches = result.jobs.filter(job => job.requestId === attempt.body.requestId);
+    if (matches.length > 1 || (matches.length === 1 && !await matchingGenericJob(matches[0], attempt))) throw new Error('Activity does not match the retained request.');
+    attempt.inspected = true;
+    if (matches.length) {
+      attempt.jobId = matches[0].id;
+      attempt.status = matches[0].status;
+      attempt.phase = 'accepted';
+      writeGenericQueueRecord(attempt);
+      renderGenericQueue(`Activity confirms job ${attempt.jobId}, recorded state: ${attempt.status}. No work was replayed. Review its result/limitations and any partial artifacts before separate work; queued or running is not completed.`);
+    } else if (attempt.jobId) {
+      throw new Error('Previously accepted job is missing.');
+    } else {
+      attempt.phase = 'absent';
+      renderGenericQueue(attempt.reloaded
+        ? 'Activity contains no matching request. Re-enter the original meeting notes if applicable, then explicitly retry. Only inputs matching the saved fingerprint and original task may use this same request ID; no replacement work is allowed.'
+        : 'Activity contains no matching request. You may explicitly retry only the original captured inputs with the same request ID; newer notes or a different task will not be substituted.');
+    }
+    workspace.jobs = result.jobs;
+    renderJobs();
+    navigate('activity');
+  } catch {
+    attempt.phase = previous === 'absent' ? 'unknown' : previous;
+    attempt.inspected = false;
+    renderGenericQueue('Activity could not confirm this request. Nothing was replayed. Inspect again before recovery; do not create a replacement request.');
+  }
+});
+$('#generic-queue-retry').addEventListener('click', async () => {
+  const attempt = genericQueueAttempt;
+  if (genericQueueStorageProblem || attempt?.phase !== 'absent') return;
+  if (attempt.reloaded) {
+    attempt.phase = 'verifying-inputs';
+    renderGenericQueue('Checking re-entered inputs against the original fingerprint. No work has been resubmitted.');
+    const body = { ...attempt.body, ...(attempt.body.kind === 'meeting_notes' ? { notes: $('#meeting-form').elements.notes.value } : {}) };
+    try {
+      if (await genericFingerprint(body, genericPayload(body), attempt.salt) !== attempt.fingerprint) {
+        attempt.phase = 'absent';
+        renderGenericQueue('Re-entered inputs do not match the original request fingerprint. Nothing was submitted or substituted; restore the original inputs before a same-ID retry.');
+        return;
+      }
+    } catch {
+      genericQueueStorageProblem = true;
+      attempt.phase = 'unknown';
+      renderGenericQueue('Input fingerprint could not be checked. Nothing was submitted.');
+      return;
+    }
+    attempt.body = body;
+    attempt.reloaded = false;
+  }
+  await submitGenericQueue();
+});
+$('#generic-queue-new').addEventListener('click', () => {
+  const attempt = genericQueueAttempt;
+  if (genericQueueStorageProblem || !attempt || !(attempt.phase === 'rejected' || (attempt.phase === 'accepted' && attempt.inspected && terminalQueueStates.has(attempt.status)))) return;
+  if (!clearGenericQueueRecord()) {
+    renderGenericQueue('Recovery identity could not be released. No separate request is permitted.');
+    return;
+  }
+  genericQueueAttempt = null;
+  $('#generic-queue-panel').hidden = true;
+  showNotice(attempt.phase === 'rejected'
+    ? 'Rejected submission released for correction. A later explicit action starts separate work; notes were not cleared or replayed.'
+    : 'Previous job retained in Activity. A later explicit action starts separate work; notes were not cleared or replayed.');
+});
+
+function restoreGenericQueue() {
+  try {
+    const saved = sessionStorage.getItem(genericQueueStorageKey);
+    if (saved === null) return;
+    if (saved.length > 2000) throw new Error('Invalid recovery record.');
+    const record = JSON.parse(saved);
+    const keys = ['version', 'requestId', 'kind', 'taskId', 'salt', 'fingerprint', 'jobId'];
+    if (!record || Object.keys(record).length !== keys.length || Object.keys(record).some(key => !keys.includes(key)) ||
+        record.version !== 1 || typeof record.requestId !== 'string' || !queueUuid.test(record.requestId) || !genericQueueKinds.has(record.kind) ||
+        !(record.taskId === null || (typeof record.taskId === 'string' && queueUuid.test(record.taskId))) ||
+        (record.taskId !== null && !['task_summary', 'document', 'word_document'].includes(record.kind)) ||
+        typeof record.salt !== 'string' || !queueUuid.test(record.salt) || typeof record.fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(record.fingerprint) ||
+        !(record.jobId === null || (typeof record.jobId === 'string' && queueUuid.test(record.jobId)))) throw new Error('Invalid recovery record.');
+    genericQueueAttempt = {
+      body: { kind: record.kind, requestId: record.requestId, ...(record.taskId ? { taskId: record.taskId } : {}) },
+      salt: record.salt, fingerprint: record.fingerprint, jobId: record.jobId,
+      phase: 'unknown', uncertain: true, inspected: false, reloaded: true
+    };
+    renderGenericQueue('Restored unresolved request identity only, not its notes or outcome. Inspect Activity before any recovery; no work was replayed.');
+  } catch {
+    genericQueueStorageProblem = true;
+    renderGenericQueue('Saved queue recovery identity could not be read. No request was submitted or silently replaced.');
+  }
+}
+restoreGenericQueue();
+
+function validDemoReceipt(receipt, requestId, format) {
+  const job = receipt?.job;
+  return receipt?.message && typeof receipt.message === 'string' &&
+    job?.kind === 'fake_demo' && job.requestId === requestId && job.payload?.confirmFakeOnly === true &&
+    job.payload?.format === format && job.taskId === null && queueUuid.test(job.id || '') &&
+    ['queued', 'running', 'completed', 'partial', 'failed', 'interrupted'].includes(job.status);
+}
+
+let demoSubmissionPending = false;
+const demoRequestStorageKey = 'esquie-unresolved-demo-request';
+let unresolvedDemoRequest = null;
+try {
+  const saved = sessionStorage.getItem(demoRequestStorageKey);
+  if (saved) {
+    const parsed = JSON.parse(saved);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+        Object.keys(parsed).some(key => !['requestId', 'format'].includes(key)) ||
+        typeof parsed.requestId !== 'string' || !queueUuid.test(parsed.requestId) ||
+        (parsed.format !== undefined && !['markdown', 'pptx'].includes(parsed.format))) throw new Error('Invalid saved demo request.');
+    unresolvedDemoRequest = parsed;
+  }
+} catch {
+  unresolvedDemoRequest = { requestId: 'unavailable; saved request state could not be read' };
+}
+
+function renderDemoRecovery() {
+  $('#demo-recovery').hidden = !unresolvedDemoRequest;
+  $('#demo-recovery-status').textContent = unresolvedDemoRequest
+    ? `Demo request ${unresolvedDemoRequest.requestId} (${unresolvedDemoRequest.format || 'legacy format unknown'}) has an unresolved queue outcome. Inspect Activity; do not blindly retry. No result is claimed.`
+    : '';
+  $('#fake-demo-form button[type="submit"]').disabled = demoSubmissionPending || Boolean(unresolvedDemoRequest);
+  $('#fake-demo-form').elements.confirmFakeOnly.disabled = Boolean(unresolvedDemoRequest);
+  $('#fake-demo-form').elements.format.disabled = Boolean(unresolvedDemoRequest);
+}
+
+function resolveDemoRequest() {
+  sessionStorage.removeItem(demoRequestStorageKey);
+  unresolvedDemoRequest = null;
+}
+
+async function submitFakeDemo(form) {
+  const confirmation = form.elements.confirmFakeOnly;
+  const format = form.elements.format.value;
+  const button = form.querySelector('button[type="submit"]');
+  if (demoSubmissionPending) {
+    showNotice('The current demo request is still in progress. Do not retry an uncertain outcome.', true);
+    return;
+  }
+  if (unresolvedDemoRequest) {
+    renderDemoRecovery();
+    showNotice('The prior demo request is unresolved. Review Activity and explicitly acknowledge a separate new attempt before providing fresh fake-only consent.', true);
+    return;
+  }
+  if (!confirmation.checked) {
+    showNotice('Explicitly check the fake-only request box before each demo attempt.', true);
+    confirmation.focus();
+    return;
+  }
+  if (!['markdown', 'pptx'].includes(format)) {
+    showNotice('Choose Markdown or PowerPoint explicitly before requesting a demo.', true);
+    form.elements.format.focus();
+    return;
+  }
+  demoSubmissionPending = true;
+  button.disabled = true;
+  const requestId = crypto.randomUUID();
+  try {
+    try {
+      sessionStorage.setItem(demoRequestStorageKey, JSON.stringify({ requestId, format }));
+      unresolvedDemoRequest = { requestId, format };
+    } catch {
+      showNotice('Demo was not submitted: per-window recovery storage is unavailable. Restore browser storage before requesting a demo.', true);
+      return;
+    }
+    confirmation.checked = false;
+    let receipt;
+    try {
+      receipt = await api('/api/jobs', {
+        method: 'POST', body: JSON.stringify({ kind: 'fake_demo', requestId, confirmFakeOnly: true, format })
+      });
+    } catch (error) {
+      if (error?.definitiveRejection === true) {
+        resolveDemoRequest();
+        form.elements.format.value = '';
+      }
+      showNotice(error?.definitiveRejection === true
+        ? `Demo request was rejected and no queue receipt was accepted: ${error.message}`
+        : 'Demo queue outcome is unknown: no verified receipt was received. Inspect Activity before taking any further action; do not blindly retry.', true);
+      return;
+    }
+    if (!validDemoReceipt(receipt, requestId, format)) {
+      showNotice('Demo queue outcome is unknown: the response did not contain a valid matching receipt. Inspect Activity before taking any further action; do not blindly retry.', true);
+      return;
+    }
+    resolveDemoRequest();
+    form.elements.format.value = '';
+    showNotice(`Fake-only ${format === 'pptx' ? 'PowerPoint' : 'Markdown'} demo request accepted (${receipt.job.id}). No result is claimed until the worker finishes.`);
+    try {
+      await refreshState();
+    } catch (error) {
+      showNotice(`Fake-only demo request ${receipt.job.id} was accepted, but the workspace could not refresh: ${error.message}. Inspect Activity; do not submit another request to recover the display.`, true);
+    }
+  } catch {
+    showNotice('Demo recovery storage could not be updated. Inspect Activity before proceeding; the unresolved request remains blocked and was not retried.', true);
+  } finally {
+    demoSubmissionPending = false;
+    renderDemoRecovery();
+  }
+}
+
+$('#demo-review-activity').addEventListener('click', () => navigate('activity'));
+$('#demo-allow-new').addEventListener('click', () => {
+  if (demoSubmissionPending || !unresolvedDemoRequest) return;
+  if (!$('#demo-reviewed').checked) {
+    showNotice('Review Activity and acknowledge the prior outcome before allowing a separate request.', true);
+    return;
+  }
+  try {
+    resolveDemoRequest();
+    $('#demo-reviewed').checked = false;
+    $('#fake-demo-form').elements.confirmFakeOnly.checked = false;
+    $('#fake-demo-form').elements.format.value = '';
+    renderDemoRecovery();
+    showNotice('No previous request was retried. Provide fresh fake-only consent only if you intend a separate new attempt.');
+  } catch {
+    showNotice('Recovery storage could not be cleared. The demo form remains blocked; no request was submitted.', true);
+  }
+});
+renderDemoRecovery();
+
 function renderActivity() {
   const host = $('#activity-list');
   host.replaceChildren();
   if (!workspace.activity.length) {
     host.append(makeElement('p', 'empty-lane', 'No local activity yet.'));
-    return;
   }
+  for (const task of workspace.tasks) renderTaskUndoActions(host, task);
   for (const item of workspace.activity) {
     const row = makeElement('div', 'activity-item');
     row.append(makeElement('span', '', item.message));
@@ -1419,6 +2441,7 @@ async function renderConnections() {
       host.append(card);
     }
     const m365 = connections.microsoft365;
+    renderJobs();
     $('#microsoft365-status').textContent = m365.hostAuthenticationAvailable
       ? `${m365.state}${m365.reason ? ` · ${m365.reason}` : ''}. Owner verification does not imply source permission or synchronization.`
       : 'Unavailable: this host has no trustworthy authenticated delegated token provider. IDs and consent alone cannot enable a connection.';
@@ -1441,6 +2464,7 @@ async function renderConnections() {
     renderJobs();
   } catch (error) {
     latestConnections = null;
+    renderJobs();
     updateOutlookDraftAvailability();
     host.replaceChildren(makeElement('p', 'empty-panel', `Connection status unavailable: ${error.message}`));
     $('#file-content-status').textContent = 'Selected file content unavailable: host connection status could not be verified; no read was attempted.';
@@ -1462,13 +2486,23 @@ async function refreshState() {
     preferences: loaded.preferences || {},
     timezoneStatus: loaded.timezoneStatus,
     documents: loaded.documents || [],
+    outcomeExportRequests: loaded.outcomeExportRequests || [],
     records: loaded.records || [],
+    pipelineSnapshots: loaded.pipelineSnapshots || [],
     sourceConsent: loaded.sourceConsent || null,
     draftOperations: loaded.draftOperations || [],
     backups: loaded.backups || [],
     recoveries: loaded.recoveries || [],
     onboarding: loaded.onboarding, sourceConfigurationDraft: loaded.sourceConfigurationDraft
   };
+  if (workspace.outcomeExportRequests.length === 1) {
+    if (!outcomeExportWorkflow.observePendingRequest(workspace.outcomeExportRequests[0])) {
+      outcomeExportStatus.textContent = 'A different unresolved server-side export was found. Inspect Documents and Activity before resolving the request shown in this workspace.';
+    }
+  } else if (workspace.outcomeExportRequests.length > 1) {
+    outcomeExportStatus.textContent = 'Multiple unresolved server-side export requests were found. No new workbook can be started until each is inspected and resolved.';
+  }
+  renderOutcomeExportControls();
   renderTasks();
   renderDrafts();
   renderLinks();
@@ -1476,22 +2510,50 @@ async function refreshState() {
   renderProfile();
   renderJobs();
   renderRecords();
+  renderPipeline();
   renderDraftOperations();
   renderBackups();
   await renderConnections();
   renderSetup();
 }
 
-function navigate(view) {
-  if (!viewNames[view]) return;
+function navigate(route) {
+  const outcomeMatch = /^outcomes\/([a-z]+)$/.exec(route);
+  if (outcomeMatch && !outcomeViews.has(outcomeMatch[1])) return;
+  const view = outcomeMatch ? 'outcomes' : route;
+  if (!Object.hasOwn(viewNames, view)) return;
+  const area = workViews.has(view) ? 'work' : portfolioViews.has(view) ? 'portfolio' : view;
+  const sidebarSections = ['work', 'portfolio', 'outcomes'].map(name => ({
+    name, element: $(`#sidebar-${name}`)
+  }));
+  const focusedHiddenSection = sidebarSections.some(section => section.name !== area && section.element.contains(document.activeElement));
+  if (focusedHiddenSection) {
+    const target = [...document.querySelectorAll('[data-view]')].find(button => button.dataset.area === area);
+    target?.focus();
+  }
+  for (const section of sidebarSections) section.element.hidden = section.name !== area;
+  currentView = view;
+  if (workViews.has(view)) lastWorkView = view;
   document.querySelectorAll('.view').forEach(section => { section.hidden = section.id !== `view-${view}`; });
   document.querySelectorAll('[data-view]').forEach(button => {
-    const selected = button.dataset.view === view;
+    const selected = button.dataset.area === 'work' ? workViews.has(view)
+      : button.dataset.view === view || (button.dataset.area === 'portfolio' && portfolioViews.has(view));
     button.classList.toggle('selected', selected);
     if (button.tagName === 'BUTTON') button.setAttribute('aria-current', selected ? 'page' : 'false');
   });
+  const setupButton = $('#resume-setup');
+  setupButton.classList.toggle('selected', view === 'setup');
+  setupButton.setAttribute('aria-current', view === 'setup' ? 'page' : 'false');
+  if (outcomeMatch) {
+    $('#outcome-view-filter').value = outcomeMatch[1];
+    renderRecords();
+  } else if (view === 'outcomes' && ($('#outcome-view-filter').value || 'all') !== 'all') {
+    $('#outcome-view-filter').value = 'all';
+    renderRecords();
+  }
+  syncOutcomeNavigation();
   $('#breadcrumb').textContent = viewNames[view];
-  if (location.hash !== `#${view}`) history.replaceState(null, '', `#${view}`);
+  if (location.hash !== `#${route}`) history.replaceState(null, '', `#${route}`);
 }
 
 function renderTaskSourceReview() {
@@ -1529,10 +2591,33 @@ function closeTaskDialog() {
 $('#close-task').addEventListener('click', closeTaskDialog);
 $('#cancel-task').addEventListener('click', closeTaskDialog);
 $('#task-dialog').addEventListener('cancel', event => { if (localFormBusy($('#task-form'))) event.preventDefault(); });
-$('#task-search').addEventListener('input', renderTasks);
+$('#task-search').addEventListener('input', () => {
+  $('#completed-work-search').value = $('#task-search').value;
+  renderTasks();
+});
 $('#show-done').addEventListener('change', renderTasks);
-$('#task-account-filter').addEventListener('change', renderTasks);
-document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => navigate(button.dataset.view)));
+$('#task-account-filter').addEventListener('change', () => {
+  $('#completed-work-account-filter').value = $('#task-account-filter').value;
+  renderTasks();
+});
+$('#completed-work-search').addEventListener('input', () => {
+  $('#task-search').value = $('#completed-work-search').value;
+  renderTasks();
+});
+$('#completed-work-account-filter').addEventListener('change', () => {
+  $('#task-account-filter').value = $('#completed-work-account-filter').value;
+  renderTasks();
+});
+$('#completed-work-period').addEventListener('change', renderCompletedWork);
+document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
+  const filter = $('#outcome-view-filter').value;
+  const route = button.dataset.area === 'work' ? lastWorkView
+    : button.dataset.area === 'outcomes' && filter && filter !== 'all' && outcomeViews.has(filter)
+      ? `outcomes/${filter}` : button.dataset.view;
+  navigate(route);
+}));
+document.querySelectorAll('[data-outcome-view]').forEach(button => button.addEventListener('click', () =>
+  navigate(`outcomes/${button.dataset.outcomeView}`)));
 window.addEventListener('hashchange', () => navigate(location.hash.slice(1) || 'board'));
 
 $('#task-form').addEventListener('submit', async event => {
@@ -1730,6 +2815,63 @@ $('#meeting-insight-list-reset').addEventListener('click', () => {
   $('#meeting-insight-list-reset').hidden = true;
   $('#meeting-insight-list-status').textContent = 'To request another list, review the meeting and give new consent.';
 });
+$('#meeting-insight-detail-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const status = $('#meeting-insight-detail-status');
+  if (meetingInsightDetailAttempt) return;
+  if (!currentSelectedMeetingInsight() || !form.elements.detailConsent.checked) {
+    status.textContent = 'Select a current authorized list item and separately approve this exact detail read.';
+    return;
+  }
+  const attempt = { ...selectedMeetingInsight, requestId: crypto.randomUUID(), phase: 'pending' };
+  meetingInsightDetailAttempt = attempt;
+  form.elements.detailConsent.disabled = true;
+  $('#meeting-insight-detail-form button[type="submit"]').disabled = true;
+  status.textContent = `Submitting detail request ${attempt.requestId}. Do not submit another request.`;
+  try {
+    const receipt = await api('/api/jobs', {
+      method: 'POST',
+      body: JSON.stringify({
+        kind: 'meeting_insight_detail', listJobId: attempt.listJobId,
+        insightId: attempt.insightId, detailConsent: true, requestId: attempt.requestId
+      })
+    }, null, 202);
+    const job = receipt?.job;
+    if (!job || typeof job.id !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(job.id) ||
+        job.kind !== 'meeting_insight_detail' || job.requestId !== attempt.requestId ||
+        job.payload?.meetingId !== attempt.meetingId || job.payload?.insightId !== attempt.insightId ||
+        job.payload?.listJobId !== attempt.listJobId || job.status !== 'queued') throw new Error('Invalid receipt.');
+    form.elements.detailConsent.checked = false;
+    try {
+      await refreshState();
+      status.textContent = `Detail request ${attempt.requestId} was queued. Check Activity for its result.`;
+      meetingInsightDetailAttempt = null;
+      form.elements.detailConsent.disabled = false;
+      $('#meeting-insight-detail-form button[type="submit"]').disabled = false;
+    } catch {
+      attempt.phase = 'queued-refresh-failed';
+      status.textContent = `Detail request ${attempt.requestId} was queued, but Activity could not be refreshed. Check Activity before starting another request; do not blindly retry.`;
+      $('#meeting-insight-detail-reset').hidden = false;
+    }
+  } catch {
+    attempt.phase = 'unknown';
+    form.elements.detailConsent.checked = true;
+    status.textContent = `The queue outcome for detail request ${attempt.requestId} is unknown. The selection and consent are retained. Check Activity before starting another request; do not blindly retry.`;
+    $('#meeting-insight-detail-reset').hidden = false;
+  }
+});
+$('#meeting-insight-detail-reset').addEventListener('click', () => {
+  if (!meetingInsightDetailAttempt || meetingInsightDetailAttempt.phase === 'pending' ||
+      !confirm('Have you checked Activity for this request? Starting another request can repeat a read.')) return;
+  meetingInsightDetailAttempt = null;
+  const form = $('#meeting-insight-detail-form');
+  form.elements.detailConsent.disabled = false;
+  form.elements.detailConsent.checked = false;
+  $('#meeting-insight-detail-form button[type="submit"]').disabled = false;
+  $('#meeting-insight-detail-reset').hidden = true;
+  $('#meeting-insight-detail-status').textContent = 'To request another detail, review the selection and give new consent.';
+});
 $('#assistant-form').addEventListener('submit', async event => {
   event.preventDefault();
   try {
@@ -1817,12 +2959,51 @@ for (const [id, endpoint, field] of [
 }
 $('#fake-demo-form').addEventListener('submit', async event => {
   event.preventDefault();
-  await queueJob('fake_demo', { confirmFakeOnly: event.currentTarget.elements.confirmFakeOnly.checked });
+  await submitFakeDemo(event.currentTarget);
 });
 
 $('#close-conversation').addEventListener('click', closeConversation);
 $('#conversation-dialog').addEventListener('cancel', closeConversation);
 $('#close-document').addEventListener('click', () => $('#document-dialog').close());
+$('#task-owner-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (conversationBusy() || !conversationTaskId) return;
+  const taskId = conversationTaskId;
+  const revision = taskOwnerRevision;
+  const nextOwner = form.elements.nextOwner.value;
+  await saveLocalForm(form, {
+    path: `/api/tasks/${encodeURIComponent(taskId)}/next-owner`, method: 'POST', body: { nextOwner, revision },
+    validate(result) {
+      const task = savedLocalItem(result.task, taskId, true);
+      const savedOwner = typeof task.nextOwner === 'string' ? task.nextOwner : '';
+      if (task.revision === revision) {
+        const receipt = result.receipt;
+        if (savedOwner !== nextOwner || receipt?.kind !== 'next-owner-unchanged' || receipt.status !== 'unchanged' ||
+            receipt.taskId !== taskId || receipt.nextOwner !== nextOwner ||
+            receipt.requestRevision !== revision || receipt.appliedRevision !== revision) {
+          throw new Error('The unchanged next-owner receipt did not match this edit.');
+        }
+        return;
+      }
+      const receipt = task.history?.at(-1);
+      if (task.revision !== revision + 1 || task.nextOwner !== nextOwner ||
+          receipt?.kind !== 'next-owner-changed' || receipt.nextOwner !== nextOwner ||
+          receipt.requestRevision !== revision || receipt.appliedRevision !== revision + 1) {
+        throw new Error('The saved next-owner receipt did not match this edit.');
+      }
+    },
+    accept(result) {
+      taskOwnerBaseline = nextOwner;
+      taskOwnerRevision = result.task.revision;
+      $('#task-owner-current').textContent = `Saved next owner: ${nextOwner || 'Unknown'} (owner-entered, unverified)`;
+    },
+    refresh: async () => { await refreshState(); await renderConversation(); },
+    success: result => result.receipt?.kind === 'next-owner-unchanged'
+      ? 'Next-owner label already matches; no task history or activity was changed.'
+      : 'Next-owner label saved locally as unverified context; no assignment or external action occurred.'
+  });
+});
 $('#conversation-form').addEventListener('submit', async event => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -1843,20 +3024,89 @@ $('#evidence-form').addEventListener('submit', async event => {
   if (conversationBusy() || !conversationTaskId) return;
   const taskId = conversationTaskId;
   const body = Object.fromEntries(new FormData(form));
+  const unlinked = !body.url;
+  if (unlinked) body.requestId = crypto.randomUUID();
   await saveLocalForm(form, {
     path: `/api/tasks/${taskId}/evidence`, method: 'POST', body,
-    validate: result => savedLocalItem(result.evidence),
-    accept(result, unchanged) { if (unchanged) form.reset(); },
+    validate(result) {
+      const evidence = savedLocalItem(result.evidence);
+      const clean = value => value.normalize('NFC').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').trim();
+      let expectedUrl = '';
+      if (!unlinked) {
+        try {
+          const parsed = new URL(clean(body.url));
+          if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) expectedUrl = null;
+          else expectedUrl = parsed.href;
+        } catch { expectedUrl = null; }
+      }
+      if (result.taskId !== taskId || typeof result.deduplicated !== 'boolean' ||
+          !['email', 'meeting', 'teams', 'document', 'note'].includes(body.type) ||
+          evidence.type !== body.type || evidence.url !== expectedUrl) {
+        throw new Error('The saved evidence receipt did not match this request.');
+      }
+      if (unlinked && (evidence.requestId !== body.requestId ||
+          evidence.provenance !== 'owner-provided-unverified' ||
+          evidence.title !== clean(body.title) || evidence.note !== clean(body.note))) {
+        throw new Error('The saved evidence receipt did not match this request.');
+      }
+      if (!unlinked && !result.deduplicated &&
+          (evidence.provenance !== 'owner-provided-unverified' ||
+           evidence.title !== clean(body.title) || evidence.note !== clean(body.note))) {
+        throw new Error('The saved evidence receipt did not match this request.');
+      }
+    },
+    accept(result, unchanged) { if (unchanged && !result.deduplicated) form.reset(); },
     refresh: async () => { await refreshState(); await renderConversation(); },
-    success: 'Evidence attached as owner-provided, unverified context.'
+    success: result => result.deduplicated
+      ? 'Existing evidence retained; your submitted title and note were not applied and remain available in the form.'
+      : 'Evidence attached as owner-provided, unverified context; nothing was fetched.'
   });
+  if (unlinked && localFormOperations.get(form)?.blocked) {
+    form.querySelector('[data-save-status]').textContent += ` Evidence request ID: ${body.requestId}. Inspect saved evidence after reloading.`;
+  }
 });
-$('#summarize-task').addEventListener('click', () => queueJob('task_summary', { taskId: conversationTaskId }));
+$('#summarize-task').addEventListener('click', () => {
+  if (!conversationTaskId) { showNotice('Select the exact task before requesting its outline.', true); return; }
+  return queueJob('task_summary', { taskId: conversationTaskId });
+});
 document.querySelectorAll('[data-job]').forEach(button => button.addEventListener('click', () => queueJob(button.dataset.job)));
 $('#meeting-form').addEventListener('submit', async event => {
   event.preventDefault();
   await queueJob('meeting_notes', { notes: event.currentTarget.elements.notes.value });
 });
+sspDirectory = bindLocalSspDirectory({
+  document, form: $('#ssp-form'), newButton: $('#new-ssp'), status: $('#ssp-status'),
+  check: $('#ssp-check'), host: $('#ssp-list'),
+  storage: {
+    getItem: key => sessionStorage.getItem(key), setItem: (key, value) => sessionStorage.setItem(key, value)
+  },
+  randomUUID: () => crypto.randomUUID(), getRecords: () => workspace.records || [],
+  send: (id, body) => api(`/api/portfolio/ssps/${encodeURIComponent(id)}`, { method: 'POST', body: JSON.stringify(body) }, null, 201),
+  refresh: refreshState, formatDate, confirmDiscard: () => window.confirm('Discard unsaved local SSP edits and switch records?'),
+  onRecorded: record => {
+    workspace.records ||= [];
+    const existing = workspace.records.find(item => item.id === record.id);
+    if (!existing) workspace.records.unshift(record);
+    else if (existing.revision <= record.revision) Object.assign(existing, record);
+  }
+});
+
+accountMetricWorkflow = bindAccountMetricForm({
+  document, form: $('#account-metric-form'), status: $('#account-metric-status'), check: $('#account-metric-check'), repeat: $('#account-metric-repeat'),
+  storage: {
+    getItem: key => sessionStorage.getItem(key), setItem: (key, value) => sessionStorage.setItem(key, value),
+    removeItem: key => sessionStorage.removeItem(key)
+  },
+  randomUUID: () => crypto.randomUUID(),
+  getRecords: () => workspace.records || [],
+  send: (id, body) => api(`/api/records/${encodeURIComponent(id)}/metrics`, { method: 'POST', body: JSON.stringify(body) }, null, 201),
+  refresh: refreshState,
+  onRecorded: record => {
+    const existing = (workspace.records || []).find(item => item.id === record.id);
+    if (existing && (existing.revision || 0) <= record.revision) Object.assign(existing, record);
+  }
+});
+
 accountSubmission = bindAccountFormSubmission({
   form: $('#account-form'),
   submitButton: $('#account-form').querySelector('[type="submit"]'),
@@ -1925,6 +3175,14 @@ outcomeForm.addEventListener('submit', async event => {
 });
 
 $('#account-search').addEventListener('input', renderRecords);
+$('#outcome-search').addEventListener('input', renderRecords);
+$('#outcome-view-filter').addEventListener('change', () => {
+  renderRecords();
+  const filter = $('#outcome-view-filter').value || 'all';
+  if (currentView === 'outcomes' && outcomeViews.has(filter) && location.hash !== `#outcomes/${filter}`) {
+    history.replaceState(null, '', `#outcomes/${filter}`);
+  }
+});
 $('#new-account').addEventListener('click', () => {
   if (!confirmAccountFormReplacement()) return;
   resetAccountForm();

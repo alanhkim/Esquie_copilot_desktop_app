@@ -130,6 +130,7 @@ export function parseMonthlyOutcomeTable(text, { today = null } = {}) {
     if (markdown && index === 0 && cells.length === headers.length &&
       cells.every(cell => /^:?-{3,}:?$/.test(cell))) continue;
     if (cells.length !== headers.length) throw invalid('Every pasted row must have the same number of columns as the header.');
+    if (cells.every(cell => !cell)) throw invalid('Workshop tables cannot contain empty rows.');
     const at = index => index < 0 ? '' : cells[index];
     const date = dateValue(at(dateIndex));
     const account = at(accountIndex).trim();

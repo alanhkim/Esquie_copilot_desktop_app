@@ -249,6 +249,8 @@ export interface Microsoft365Connectors {
     loop: { read(options?: ReadOptions): Promise<never> };
     meetingInsights: ReadConnector<MeetingInsightEvidence>;
     meetingInsightList: { read(options: { meetingId: string; signal?: AbortSignal; checkpoint?: () => boolean }): Promise<ReadResult<MeetingInsightMetadata>> };
+    /** Host must validate an exact current-owner list result and separate per-read consent first. */
+    meetingInsightSelection: { read(options: { meetingId: string; insightId: string; consent: true; signal?: AbortSignal; checkpoint?: () => boolean }): Promise<ReadResult<MeetingInsightEvidence>> };
   };
 }
 

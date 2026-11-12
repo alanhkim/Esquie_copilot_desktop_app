@@ -1,20 +1,26 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFile as writeFileCallback } from 'node:fs';
+import { lstat, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { openStore } from './store.mjs';
 import { createWorker, enqueue, quietHoursActive, quietHoursValid, timezoneAvailable, timezoneStatus } from './worker.mjs';
 import { assertOutputAllowed, assertPlainLocalFile, verifyLocalVolume as defaultVerifyLocalVolume } from './local-output.mjs';
+import { documentFileName, documentFormat } from './document-format.mjs';
 import { createMicrosoft365Connectors, ConnectorError } from './connectors/microsoft365.mjs';
 import { environmentProxyConfigured, normalizeApprovedHost } from './connectors/safe-file-download.mjs';
 import { createAssistantBridge } from './assistant/bridge.mjs';
 import { assertPrivateDataDirectory, assertPrivateStorage } from './private-storage.mjs';
-import { recoverLocalBackup } from './backups.mjs';
+import { MAX_LOCAL_DOCUMENT_BYTES, readVerifiedLocalFile, recoverLocalBackup } from './backups.mjs';
 import { confirmMonthlyOutcomeImport, previewMonthlyOutcomeImport } from './monthly-outcomes-import.mjs';
+import { confirmPipelineSnapshot, previewPipelineSnapshot } from './pipeline-snapshots.mjs';
+import { createMonthlyOutcomesWorkbook, MAX_MONTHLY_OUTCOMES_XLSX_BYTES } from './monthly-outcomes-xlsx.mjs';
 import { createWindowsOcrService, decodeWindowsOcrImage, WindowsOcrError } from './windows-ocr.mjs';
+import { monthlyOutcomeRecords, monthlyOutcomesSnapshotPayload } from '../public/outcome-export-workflow.mjs';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const PUBLIC_FILES = new Map([
@@ -23,17 +29,28 @@ const PUBLIC_FILES = new Map([
   ['/styles.css', ['styles.css', 'text/css; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/task-board.mjs', ['task-board.mjs', 'text/javascript; charset=utf-8']],
+  ['/completed-work.mjs', ['completed-work.mjs', 'text/javascript; charset=utf-8']],
   ['/account-search.mjs', ['account-search.mjs', 'text/javascript; charset=utf-8']],
   ['/account-workspace.mjs', ['account-workspace.mjs', 'text/javascript; charset=utf-8']],
-  ['/outcome-import-workflow.mjs', ['outcome-import-workflow.mjs', 'text/javascript; charset=utf-8']]
+  ['/outcome-import-workflow.mjs', ['outcome-import-workflow.mjs', 'text/javascript; charset=utf-8']],
+  ['/outcome-export-workflow.mjs', ['outcome-export-workflow.mjs', 'text/javascript; charset=utf-8']],
+  ['/pipeline-snapshots.mjs', ['pipeline-snapshots.mjs', 'text/javascript; charset=utf-8']],
+  ['/portfolio-workspace.mjs', ['portfolio-workspace.mjs', 'text/javascript; charset=utf-8']]
 ]);
 const TASK_STATUSES = new Set(['next', 'doing', 'waiting', 'done']);
 const MAX_BODY_BYTES = 20_000;
+// Worst-case JSON escaping for evidence title, note and URL fits in this route-specific cap.
+const MAX_EVIDENCE_BODY_BYTES = 65_000;
 // Escaped JSON for the four advertised account fields fits within this route-specific cap.
 const MAX_ACCOUNT_BODY_BYTES = 80_000;
 const MAX_OUTCOMES_IMPORT_BODY_BYTES = 128_000;
 const MAX_OUTCOMES_OCR_BODY_BYTES = 8_500_000;
+const MAX_PIPELINE_SNAPSHOT_BODY_BYTES = 128_000;
+const MAX_OUTCOME_EXPORT_BODY_BYTES = 2_000;
 const MAX_ACTIVITY_ITEMS = 100;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SHA256 = /^[0-9a-f]{64}$/i;
+const writeOpenFile = promisify(writeFileCallback);
 
 function taskAccountId(state, value) {
   if (value === '') return '';
@@ -98,6 +115,40 @@ function outcomesImportCall(action) {
     }
     throw error;
   }
+}
+
+function pipelineSnapshotCall(action) {
+  try { return action(); }
+  catch (error) {
+    if (Number.isInteger(error?.status) && error.status >= 400 && error.status < 500) {
+      throw new HttpError(error.status, error.message);
+    }
+    throw error;
+  }
+}
+
+function sameSyncFile(left, right) {
+  const sameDevice = left.dev === right.dev ||
+    (process.platform === 'win32' && (left.dev === 0n || right.dev === 0n));
+  return sameDevice && left.ino === right.ino && left.size === right.size &&
+    left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+function readVerifiedSyncOutput(path, rootDevice, limit) {
+  const before = lstatSync(path, { bigint: true });
+  const sameDevice = before.dev === rootDevice ||
+    (process.platform === 'win32' && (before.dev === 0n || rootDevice === 0n));
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n ||
+      before.ino === 0n || !sameDevice || realpathSync(path) !== resolve(path) ||
+      before.size > BigInt(limit)) {
+    throw new Error('The local workbook file failed its private single-link and volume checks.');
+  }
+  const content = readFileSync(path);
+  const after = lstatSync(path, { bigint: true });
+  if (!sameSyncFile(before, after) || BigInt(content.length) !== after.size) {
+    throw new Error('The local workbook changed during verification.');
+  }
+  return content;
 }
 
 function assertOnlyKeys(body, allowed, message) {
@@ -226,6 +277,17 @@ function taskEvent(task, kind, at, details = {}) {
   task.history.push({ id: randomUUID(), kind, at, ...details });
 }
 
+function taskUndoResult(task, event) {
+  return {
+    task,
+    undoReceipt: {
+      id: event.id, kind: 'task-undo', status: 'applied', taskId: task.id,
+      eventId: event.eventId, requestId: event.requestId,
+      requestRevision: event.requestRevision, appliedRevision: event.appliedRevision
+    }
+  };
+}
+
 function updateProfile(state, body) {
   const allowed = new Set(['displayName', 'timezone', 'email', 'manager', 'people', 'workspaceName', 'role', 'writingStyle']);
   if (!Object.keys(body).length) throw new HttpError(400, 'Enter supported local profile fields.');
@@ -281,6 +343,18 @@ function saveLocalRecord(state, body, now, category) {
   return created;
 }
 
+function localMetricValues(body) {
+  if (body.confirmOwnerEntered !== true) throw new HttpError(400, 'Explicitly confirm an owner-entered, unverified local observation.');
+  if (typeof body.value !== 'string' || !/^-?(?:0|[1-9][0-9]{0,23})(?:\.[0-9]{1,12})?$/.test(body.value)) {
+    throw new HttpError(400, 'Enter an exact decimal string: up to 24 whole digits and 12 fractional digits, without exponent notation.');
+  }
+  return {
+    label: safeText(body.label, 'Metric label', 100, { required: true }),
+    value: body.value,
+    unit: body.unit === undefined ? '' : safeText(body.unit, 'Metric unit', 40),
+    date: body.date === undefined || body.date === '' ? '' : safeDate(body.date)
+  };
+}
 function sourceConsent(body) {
   const object = (value, label) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HttpError(400, `${label} must be an object.`);
@@ -345,7 +419,9 @@ export async function startServer({
   clock = () => new Date(),
   workerIntervalMs = 1000,
   verifyLocalVolume = defaultVerifyLocalVolume,
-  windowsOcrService = null
+  windowsOcrService = null,
+  buildMonthlyOutcomesWorkbook = createMonthlyOutcomesWorkbook,
+  writeMonthlyOutcomesFile = writeOpenFile
 } = {}) {
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('ESQUIE_PORT must be an integer from 0 to 65535.');
   const microsoft365 = createMicrosoft365Connectors(microsoft365Options);
@@ -386,6 +462,23 @@ export async function startServer({
   const updateState = change => store.update(change);
   const sourceConnectors = { ...microsoft365.connectors, ...connectors };
   const sourceIdentity = () => microsoft365.status().identity;
+  const selectedInsight = (listJobId, insightId) => {
+    const connection = microsoft365.status();
+    const listJob = store.state.jobs.find(job => job.id === listJobId && job.kind === 'meeting_insight_list');
+    const meetingId = listJob?.payload?.meetingId;
+    const identity = JSON.stringify(connection.identity);
+    const authorizationReference = sourceAuthorizationReference('meetingInsightList');
+    if (!connectionEpoch || connection.state !== 'connected' || !connection.verifiedOwner ||
+        !authorizationReference || listJob?.payload?.authorizationReference !== authorizationReference ||
+        listJob?.status !== 'partial' || listJob.payload.connectionEpoch !== connectionEpoch ||
+        listJob.payload.ownerReference !== identity ||
+        JSON.stringify(store.state.sourceConsent?.expectedIdentity) !== identity ||
+        !store.state.sourceConsent?.sources?.meetingInsightMeetings?.includes(meetingId) ||
+        listJob.result?.meetingInsightList?.meetingId !== meetingId ||
+        !Array.isArray(listJob.result?.meetingInsightList?.items) ||
+        !listJob.result.meetingInsightList.items.some(item => item.meetingId === meetingId && item.id === insightId)) return null;
+    return { meetingId, insightId, listJobId, connectionEpoch, ownerReference: identity, authorizationReference };
+  };
   const sourceHealth = new Map();
   let outputApprovalSequence = 0n;
   let latestOutputApproval = 0n;
@@ -537,11 +630,222 @@ export async function startServer({
     await assertOutputAllowed({ root, approved: store.state.preferences.localOutputApproved, redirected: outputRedirected, verifyVolume: verifyLocalVolume });
     assertOutput();
   };
+  const outcomeExportOperations = new Map();
+  const outcomeSnapshot = () => {
+    const records = monthlyOutcomeRecords(store.state.records);
+    const payload = monthlyOutcomesSnapshotPayload(records);
+    return {
+      records,
+      recordCount: records.length,
+      snapshotHash: createHash('sha256').update(payload).digest('hex')
+    };
+  };
+  const assertNoWorkerDocumentIdCollision = (state, requestId, duringWrite = false) => {
+    if (state.jobs.some(job => job.id === requestId && ['document', 'fake_demo'].includes(job.kind))) {
+      throw new HttpError(409, duringWrite
+        ? 'A worker document job reserved this ID while the workbook was being prepared. The workbook file remains untracked and was not claimed; inspect Documents and Activity.'
+        : 'This request ID is reserved by a local document job; no workbook was created.');
+    }
+  };
+  const createOrReuseOutcomeExport = async ({ requestId, snapshotHash, recordCount }) => {
+    assertNoWorkerDocumentIdCollision(store.state, requestId);
+    try { await verifyOutput(); }
+    catch { throw new HttpError(403, 'Private local output approval or its storage checks are unavailable; no workbook was created.'); }
+    assertNoWorkerDocumentIdCollision(store.state, requestId);
+    const fileName = `monthly-outcomes-${requestId}.xlsx`;
+    const existing = store.state.documents.find(document => document.id === requestId);
+    const path = join(root, 'documents', fileName);
+    if (existing) {
+      if (existing.kind !== 'monthly-outcomes-xlsx' || existing.format !== 'xlsx' ||
+          existing.fileName !== fileName || existing.snapshotHash !== snapshotHash ||
+          existing.recordCount !== recordCount || !Number.isSafeInteger(existing.contentBytes) ||
+          existing.contentBytes < 1 || existing.contentBytes > MAX_MONTHLY_OUTCOMES_XLSX_BYTES ||
+          !SHA256.test(existing.contentSha256 || '') || typeof existing.createdAt !== 'string' ||
+          !Number.isFinite(Date.parse(existing.createdAt))) {
+        throw new HttpError(409, 'This request identifier belongs to a different or unverifiable local document; nothing was overwritten.');
+      }
+      let content;
+      try {
+        const volume = (await lstat(root, { bigint: true })).dev;
+        content = await readVerifiedLocalFile(path, { limit: MAX_MONTHLY_OUTCOMES_XLSX_BYTES, volume });
+      } catch {
+        throw new HttpError(409, 'The saved workbook could not be verified and was not overwritten. Inspect Documents and Activity.');
+      }
+      if (content.length !== existing.contentBytes || createHash('sha256').update(content).digest('hex') !== existing.contentSha256) {
+        throw new HttpError(409, 'The saved workbook differs from its generation receipt and was not overwritten.');
+      }
+      try { await verifyOutput(); }
+      catch { throw new HttpError(403, 'Private local output approval or its storage checks changed; the existing workbook was not modified.'); }
+      return {
+        reused: true,
+        export: {
+          id: existing.id, format: 'xlsx', fileName, recordCount: existing.recordCount,
+          snapshotHash: existing.snapshotHash, contentBytes: existing.contentBytes,
+          contentSha256: existing.contentSha256, createdAt: existing.createdAt
+        }
+      };
+    }
+    const snapshot = outcomeSnapshot();
+    if (snapshot.snapshotHash !== snapshotHash || snapshot.recordCount !== recordCount) {
+      throw new HttpError(409, 'Local outcome records changed. Refresh and review before starting a new export.');
+    }
+    const pendingRequest = store.state.outcomeExportRequests.find(item => item.requestId === requestId);
+    if (pendingRequest && (pendingRequest.snapshotHash !== snapshotHash || pendingRequest.recordCount !== recordCount)) {
+      throw new HttpError(409, 'This request identifier is unresolved for a different record snapshot; inspect and resolve it before exporting.');
+    }
+    if (store.state.outcomeExportRequests.some(item => item.requestId !== requestId)) {
+      throw new HttpError(409, 'Another local workbook request is unresolved. Inspect Documents and Activity before starting a new export.');
+    }
+    try {
+      lstatSync(path);
+      throw new HttpError(409, 'A file already exists at the requested workbook path; it was not overwritten. Inspect Documents and Activity.');
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      if (error.code !== 'ENOENT') throw error;
+    }
+    if (!pendingRequest) {
+      const requestedAt = clock().toISOString();
+      updateState(next => {
+        assertNoWorkerDocumentIdCollision(next, requestId);
+        if (next.outcomeExportRequests.some(item => item.requestId !== requestId)) {
+          throw new HttpError(409, 'Another local workbook request is unresolved. No new export was started.');
+        }
+        if (!next.outcomeExportRequests.some(item => item.requestId === requestId)) {
+          next.outcomeExportRequests.push({ requestId, snapshotHash, recordCount, createdAt: requestedAt });
+          recordActivity(next, 'local-outcomes-export-started', `Started a local XLSX request (${requestId}). No file is claimed until a verified receipt is saved.`, requestedAt);
+        }
+      });
+    }
+    const workbook = await buildMonthlyOutcomesWorkbook(snapshot.records);
+    if (!Buffer.isBuffer(workbook) || workbook.length < 1 || workbook.length > MAX_MONTHLY_OUTCOMES_XLSX_BYTES) {
+      throw new Error('Workbook generation did not produce a supported local XLSX file.');
+    }
+    assertNoWorkerDocumentIdCollision(store.state, requestId);
+    try { await verifyOutput(); }
+    catch { throw new HttpError(403, 'Private local output approval or its storage checks changed; no workbook was created.'); }
+    const current = outcomeSnapshot();
+    if (current.snapshotHash !== snapshotHash || current.recordCount !== recordCount) {
+      throw new HttpError(409, 'Local outcome records changed while the workbook was being prepared. No export was created.');
+    }
+    assertNoWorkerDocumentIdCollision(store.state, requestId);
+    const outputDirectory = join(root, 'documents');
+    assertOutput();
+    mkdirSync(outputDirectory, { recursive: true, mode: 0o700 });
+    const rootMetadata = lstatSync(root, { bigint: true });
+    const directoryMetadata = lstatSync(outputDirectory, { bigint: true });
+    const sameDevice = rootMetadata.dev === directoryMetadata.dev ||
+      (process.platform === 'win32' && (rootMetadata.dev === 0n || directoryMetadata.dev === 0n));
+    if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink() || !sameDevice ||
+        realpathSync(outputDirectory) !== resolve(outputDirectory)) {
+      throw new Error('The local document directory must not redirect or change volumes.');
+    }
+    assertOutput();
+    let descriptor;
+    try { descriptor = openSync(path, 'wx', 0o600); }
+    catch (error) {
+      if (error.code === 'EEXIST') throw new HttpError(409, 'A workbook already exists at the requested path; it was not overwritten. Inspect Documents and Activity.');
+      throw error;
+    }
+    try {
+      await writeMonthlyOutcomesFile(descriptor, workbook);
+      fsyncSync(descriptor);
+      const opened = fstatSync(descriptor, { bigint: true });
+      const rootDevice = lstatSync(root, { bigint: true }).dev;
+      const openedOnRoot = opened.dev === rootDevice ||
+        (process.platform === 'win32' && (opened.dev === 0n || rootDevice === 0n));
+      if (!opened.isFile() || opened.nlink !== 1n || opened.ino === 0n ||
+          !openedOnRoot || opened.size !== BigInt(workbook.length)) {
+        throw new Error('The newly written workbook failed its local file checks.');
+      }
+      const written = readVerifiedSyncOutput(path, rootDevice, MAX_MONTHLY_OUTCOMES_XLSX_BYTES);
+      const contentSha256 = createHash('sha256').update(written).digest('hex');
+      if (written.length !== workbook.length || contentSha256 !== createHash('sha256').update(workbook).digest('hex')) {
+        throw new Error('The newly written workbook failed its content verification.');
+      }
+      const createdAt = clock().toISOString();
+      const document = {
+        id: requestId, title: 'Monthly Outcomes workbook', kind: 'monthly-outcomes-xlsx',
+        format: 'xlsx', fileName, recordCount, snapshotHash,
+        contentBytes: written.length, contentSha256, createdAt
+      };
+      updateState(next => {
+        assertNoWorkerDocumentIdCollision(next, requestId, true);
+        if (next.documents.some(item => item.id === requestId)) {
+          throw new HttpError(409, 'A local document with this request identifier already exists; the workbook was not overwritten.');
+        }
+        next.documents.unshift(document);
+        next.outcomeExportRequests = next.outcomeExportRequests.filter(item => item.requestId !== requestId);
+        recordActivity(next, 'local-outcomes-export', `Saved ${recordCount} owner-entered outcome record(s) to a local XLSX workbook.`, createdAt);
+      });
+      return {
+        reused: false,
+        export: {
+          id: requestId, format: 'xlsx', fileName, recordCount, snapshotHash,
+          contentBytes: written.length, contentSha256, createdAt
+        }
+      };
+    } finally { closeSync(descriptor); }
+  };
+  const inspectOutcomeExport = async requestId => {
+    if (outcomeExportOperations.has(requestId)) return { status: 'running' };
+    const pendingRequest = store.state.outcomeExportRequests.find(item => item.requestId === requestId);
+    const fileName = `monthly-outcomes-${requestId}.xlsx`;
+    const path = join(root, 'documents', fileName);
+    const existing = store.state.documents.find(document => document.id === requestId);
+    if (existing) {
+      try {
+        const volume = (await lstat(root, { bigint: true })).dev;
+        const content = await readVerifiedLocalFile(path, { limit: MAX_MONTHLY_OUTCOMES_XLSX_BYTES, volume });
+        if (existing.kind !== 'monthly-outcomes-xlsx' || existing.format !== 'xlsx' ||
+            existing.fileName !== fileName || !Number.isSafeInteger(existing.contentBytes) ||
+            existing.contentBytes < 1 || existing.contentBytes !== content.length ||
+            !Number.isSafeInteger(existing.recordCount) || existing.recordCount < 0 ||
+            !SHA256.test(existing.snapshotHash || '') || !SHA256.test(existing.contentSha256 || '') ||
+            typeof existing.createdAt !== 'string' || !Number.isFinite(Date.parse(existing.createdAt)) ||
+            createHash('sha256').update(content).digest('hex') !== existing.contentSha256) {
+          return { status: 'unverified', fileName };
+        }
+        return {
+          status: 'committed',
+          export: {
+            id: existing.id, format: 'xlsx', fileName, recordCount: existing.recordCount,
+            snapshotHash: existing.snapshotHash, contentBytes: existing.contentBytes,
+            contentSha256: existing.contentSha256, createdAt: existing.createdAt
+          }
+        };
+      } catch { return { status: 'unverified', fileName }; }
+    }
+    try {
+      const directory = join(root, 'documents');
+      const directoryInfo = await lstat(directory, { bigint: true });
+      const rootInfo = await lstat(root, { bigint: true });
+      const sameDevice = directoryInfo.dev === rootInfo.dev ||
+        (process.platform === 'win32' && (directoryInfo.dev === 0n || rootInfo.dev === 0n));
+      if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink() || !sameDevice ||
+          await realpath(directory) !== resolve(directory)) return { status: 'unverified', fileName };
+      const file = await lstat(path, { bigint: true });
+      if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1n ||
+          await realpath(path) !== resolve(path)) return { status: 'unverified', fileName };
+      return { status: 'untracked', fileName };
+    } catch (error) {
+      if (error.code === 'ENOENT') return { status: pendingRequest ? 'interrupted' : 'absent' };
+      return { status: 'unverified', fileName };
+    }
+  };
   worker = createWorker({
     store, root, connectors: sourceConnectors, assistant, sourceIdentity, clock, intervalMs: workerIntervalMs, verifyOutput, assertOutput,
     sourceAuthorization, authorizeTeamsReply: resolveTeamsReplyEvidence,
     authorizeFileContent: resolveFileContentEvidence, fileContentAvailability: fileContentCapability,
     sourceEpoch: () => connectionEpoch, insightListConnector: microsoft365.connectors.meetingInsightList,
+    insightSelectionConnector: microsoft365.connectors.meetingInsightSelection,
+    insightSelectionCurrent: payload => {
+      const selected = selectedInsight(payload.listJobId, payload.insightId);
+      return selected && JSON.stringify(selected) === JSON.stringify({
+        meetingId: payload.meetingId, insightId: payload.insightId, listJobId: payload.listJobId,
+        connectionEpoch: payload.connectionEpoch, ownerReference: payload.ownerReference,
+        authorizationReference: payload.authorizationReference
+      });
+    },
     onSourceResult: result => {
       sourceHealth.set(result.source, result);
     }
@@ -614,14 +918,59 @@ export async function startServer({
       }
       const documentMatch = /^\/api\/documents\/([0-9a-f-]{36})$/.exec(pathname);
       if (request.method === 'GET' && documentMatch) {
-        if (!state.documents.some(item => item.id === documentMatch[1])) throw new HttpError(404, 'Document not found.');
-        const unavailable = state.documents.find(item => item.id === documentMatch[1]).fileUnavailableReason;
+        const document = state.documents.find(item => item.id === documentMatch[1]);
+        if (!document) throw new HttpError(404, 'Document not found.');
+        const unavailable = document.fileUnavailableReason;
         if (unavailable) throw new HttpError(410, unavailable);
-        const path = join(root, 'documents', `${documentMatch[1]}.md`);
-        try { await assertPlainLocalFile(path); }
-        catch { throw new HttpError(403, 'Document is missing or redirected; reading was blocked.'); }
-        const text = await readFile(path, 'utf8');
-        jsonResponse(response, 200, { text, storage: 'local-only' });
+        let format;
+        let path;
+        try {
+          format = documentFormat(document);
+          path = join(root, 'documents', documentFileName(document));
+        } catch {
+          throw new HttpError(409, 'The saved document format or filename is unsupported; reading was blocked.');
+        }
+        if (format === 'xlsx') throw new HttpError(409, 'Workbook files remain in the approved local Documents folder; browser download is not supported.');
+        let bytes;
+        if (format === 'pptx' || format === 'docx') {
+          if (!Number.isSafeInteger(document.contentBytes) || document.contentBytes < 1 ||
+              document.contentBytes > MAX_LOCAL_DOCUMENT_BYTES || !SHA256.test(document.contentSha256 || '')) {
+            throw new HttpError(409, `The ${format === 'docx' ? 'Word' : 'PowerPoint'} generation record is missing or invalid; reading was blocked.`);
+          }
+          try {
+            const rootMetadata = await lstat(root, { bigint: true });
+            if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink() ||
+                await realpath(root) !== resolve(root) || !await verifyLocalVolume(root)) {
+              throw new Error('The workspace volume could not be verified.');
+            }
+            bytes = await readVerifiedLocalFile(path, {
+              limit: MAX_LOCAL_DOCUMENT_BYTES,
+              volume: rootMetadata.dev
+            });
+          } catch {
+            throw new HttpError(409, `The ${format === 'docx' ? 'Word' : 'PowerPoint'} file could not be verified as a bounded, single-link file on the workspace volume.`);
+          }
+        } else {
+          try { await assertPlainLocalFile(path); }
+          catch { throw new HttpError(403, 'Document is missing or redirected; reading was blocked.'); }
+          bytes = await readFile(path);
+        }
+        const contentSha256 = createHash('sha256').update(bytes).digest('hex');
+        if (['pptx', 'docx'].includes(format) && (!Number.isSafeInteger(document.contentBytes) ||
+              document.contentBytes < 1 || document.contentBytes > MAX_LOCAL_DOCUMENT_BYTES ||
+              !SHA256.test(document.contentSha256 || '')) ||
+            (document.contentBytes !== undefined && bytes.length !== document.contentBytes) ||
+            (document.contentSha256 !== undefined && contentSha256 !== document.contentSha256)) {
+          throw new HttpError(409, 'The local document no longer matches its generation record; reading was blocked.');
+        }
+        jsonResponse(response, 200, {
+          format, contentBytes: bytes.length, contentSha256, storage: 'local-only',
+          text: format === 'docx'
+            ? `Verified local Word file: ${path}. It has not been uploaded or shared.`
+            : format === 'pptx'
+              ? 'A fixed synthetic PowerPoint file is saved in the approved local documents folder. It includes fictional speaker notes and is not rendered in this app.'
+            : bytes.toString('utf8')
+        });
         return;
       }
       if (request.method === 'GET' && pathname === '/api/connections') {
@@ -664,7 +1013,7 @@ export async function startServer({
           oneNote: status('oneNote', ['oneNotePages']),
           reporting: { status: 'disconnected', available: false, access: 'read-only' },
           sharepoint: status('files'),
-          microsoft365: { ...connection, hostAuthenticationAvailable: typeof microsoft365Options.tokenProvider === 'function' },
+          microsoft365: { ...connection, listSelectionEpoch: connectionEpoch, listAuthorizationReference: sourceAuthorization('meetingInsightList'), hostAuthenticationAvailable: typeof microsoft365Options.tokenProvider === 'function' },
           fileContent: fileContentCapability(),
           planner: { status: 'retired', available: false }
         });
@@ -1024,7 +1373,7 @@ export async function startServer({
         if (sequence < latestDemoApproval) throw new HttpError(409, 'A newer demo approval decision superseded this request.');
         updateState(next => { next.preferences.demoApproved = body.confirmSyntheticLocalOnly; });
         latestDemoApproval = sequence;
-        jsonResponse(response, 200, { approved: body.confirmSyntheticLocalOnly, mode: 'fixed-synthetic-local-document-only' });
+        jsonResponse(response, 200, { approved: body.confirmSyntheticLocalOnly, mode: 'fixed-synthetic-local-markdown-or-powerpoint-only' });
         return;
       }
 
@@ -1045,52 +1394,97 @@ export async function startServer({
 
       const evidenceMatch = /^\/api\/tasks\/([0-9a-f-]{36})\/evidence$/.exec(pathname);
       if (request.method === 'POST' && evidenceMatch) {
-        const body = await readJson(request);
-        assertOnlyKeys(body, new Set(['title', 'url', 'note']), 'Evidence accepts only title, URL, and note.');
-        const title = safeText(body.title, 'Evidence title', 160, { required: true });
-        const url = safeLinkUrl(body.url);
-        const note = safeText(body.note ?? '', 'Evidence note', 3000);
-        const evidence = updateState(next => {
+        const body = await readJson(request, MAX_EVIDENCE_BODY_BYTES);
+        assertOnlyKeys(body, new Set(['title', 'url', 'note', 'type', 'requestId']), 'Evidence accepts only its local type, title, URL, note, and URL-free request ID.');
+        const title = safeText(body.title, 'Evidence title', 500, { required: true });
+        const type = body.type;
+        if (type !== undefined && !['email', 'meeting', 'teams', 'document', 'note'].includes(type)) {
+          throw new HttpError(400, 'Choose a supported local evidence type.');
+        }
+        const unlinked = type !== undefined && (body.url === undefined || body.url === '');
+        const url = unlinked ? '' : safeLinkUrl(body.url);
+        if (unlinked && body.note !== undefined && typeof body.note !== 'string') throw new HttpError(400, 'Evidence note must be text.');
+        const note = safeText(body.note ?? '', 'Evidence note', 8000);
+        const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+        if (unlinked ? typeof body.requestId !== 'string' || !uuid.test(body.requestId) : Object.hasOwn(body, 'requestId')) {
+          throw new HttpError(400, 'Evidence without a URL requires its own request UUID; linked evidence does not accept a request ID.');
+        }
+        const requestId = unlinked ? body.requestId.toLowerCase() : null;
+        const requestFingerprint = unlinked ? createHash('sha256').update(JSON.stringify([
+          type, body.title, Object.hasOwn(body, 'url') ? body.url : null, body.note
+        ])).digest('hex') : null;
+        const result = updateState(next => {
+          if (unlinked) {
+            for (const other of next.tasks) {
+              const prior = other.evidence?.find(item => item.requestId === requestId);
+              if (!prior) continue;
+              if (other.id !== evidenceMatch[1] || prior.type !== type || prior.url !== '' ||
+                  prior.title !== title || prior.note !== note || prior.requestFingerprint !== requestFingerprint) {
+                throw new HttpError(409, 'This evidence request ID was already used for different task evidence.');
+              }
+              return { evidence: prior, deduplicated: true };
+            }
+          }
           const task = taskById(next, evidenceMatch[1]);
           task.evidence ||= [];
-          const existing = task.evidence.find(item => item.url === url);
-          if (existing) return existing;
-          const item = { id: randomUUID(), title, url, note, provenance: 'owner-provided-unverified', createdAt: clock().toISOString() };
+          const existing = !unlinked && task.evidence.find(item =>
+            item.url === url && (type === undefined || item.type === type));
+          if (existing) return { evidence: existing, deduplicated: true };
+          const item = { id: randomUUID(), title, url, note, ...(type === undefined ? {} : { type }),
+            ...(unlinked ? { requestId, requestFingerprint } : {}), provenance: 'owner-provided-unverified', createdAt: clock().toISOString() };
           task.evidence.push(item);
           taskEvent(task, 'evidence-added', item.createdAt, { evidenceId: item.id });
-          return item;
+          return { evidence: item, deduplicated: false };
         });
-        jsonResponse(response, 201, { evidence });
+        jsonResponse(response, 201, { ...result, taskId: evidenceMatch[1] });
         return;
       }
 
       if (request.method === 'POST' && pathname === '/api/jobs') {
         const body = await readJson(request);
-        assertOnlyKeys(body, new Set(['kind', 'taskId', 'notes', 'requestId', 'confirmFakeOnly', 'meetingId', 'listConsent']), 'Unsupported job fields.');
-        if (!['task_summary', 'meeting_notes', 'source_refresh', 'meeting_insight_list', 'document', 'fake_demo', 'backup'].includes(body.kind)) throw new HttpError(400, 'Unsupported job kind.');
+        assertOnlyKeys(body, new Set(['kind', 'taskId', 'notes', 'requestId', 'confirmFakeOnly', 'format', 'meetingId', 'listConsent', 'listJobId', 'insightId', 'detailConsent']), 'Unsupported job fields.');
+        if (!['task_summary', 'meeting_notes', 'source_refresh', 'meeting_insight_list', 'meeting_insight_detail', 'document', 'word_document', 'fake_demo', 'backup'].includes(body.kind)) throw new HttpError(400, 'Unsupported job kind.');
         if (body.kind === 'backup' && body.taskId != null) throw new HttpError(400, 'Workspace backups do not accept task inputs.');
         if (typeof body.requestId !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(body.requestId)) throw new HttpError(400, 'A UUID request ID is required.');
         if (body.taskId != null) taskById(state, body.taskId);
         if (body.kind !== 'meeting_notes' && Object.hasOwn(body, 'notes')) throw new HttpError(400, 'Only meeting-note jobs accept notes.');
-        if (body.kind === 'fake_demo' && (!store.state.preferences.demoApproved || body.confirmFakeOnly !== true || body.taskId)) {
-          throw new HttpError(403, 'Demo creation needs approved local synthetic-only configuration and explicit confirmation for this run; task/customer inputs are not accepted.');
+        if (body.kind === 'fake_demo' && !['markdown', 'pptx'].includes(body.format)) throw new HttpError(400, 'Choose Markdown or PowerPoint explicitly for this fake-only demo.');
+        if (body.kind === 'fake_demo' && (!store.state.preferences.demoApproved || !store.state.preferences.localOutputApproved ||
+            body.confirmFakeOnly !== true || body.taskId)) {
+          throw new HttpError(403, 'Demo creation needs current synthetic-demo and private local-output approvals plus explicit confirmation for this run; task/customer inputs are not accepted.');
         }
         if (body.kind !== 'fake_demo' && Object.hasOwn(body, 'confirmFakeOnly')) throw new HttpError(400, 'Fake-only confirmation applies only to demo jobs.');
+        if (body.kind !== 'fake_demo' && Object.hasOwn(body, 'format')) throw new HttpError(400, 'An output format can be selected only for fake-only demos.');
         if (body.kind !== 'meeting_insight_list' && (Object.hasOwn(body, 'meetingId') || Object.hasOwn(body, 'listConsent'))) throw new HttpError(400, 'Meeting selection and list consent apply only to meeting insight listing.');
+        if (body.kind !== 'meeting_insight_detail' && ['listJobId', 'insightId', 'detailConsent'].some(key => Object.hasOwn(body, key))) throw new HttpError(400, 'Insight selection and detail consent apply only to selected detail reads.');
         let listPayload;
         if (body.kind === 'meeting_insight_list') {
           if (body.taskId != null || body.listConsent !== true) throw new HttpError(400, 'Explicit consent for one meeting insight list is required; task inputs are not accepted.');
           const meetingId = safeText(body.meetingId, 'Meeting ID', 2000, { required: true });
           const connection = microsoft365.status();
+          const authorizationReference = sourceAuthorization('meetingInsightList');
           if (!connectionEpoch || connection.state !== 'connected' || !connection.verifiedOwner ||
+              !authorizationReference ||
               !store.state.sourceConsent?.sources?.meetingInsightMeetings?.includes(meetingId)) {
             throw new HttpError(403, 'The meeting is not authorized for listing in the current connection.');
           }
-          listPayload = { meetingId, connectionEpoch, ownerReference: JSON.stringify(connection.identity) };
+          listPayload = { meetingId, connectionEpoch, ownerReference: JSON.stringify(connection.identity), authorizationReference };
+        }
+        let detailPayload;
+        if (body.kind === 'meeting_insight_detail') {
+          if (body.taskId != null || body.detailConsent !== true) throw new HttpError(400, 'Explicit consent for one selected detail read is required; task inputs are not accepted.');
+          if (typeof body.listJobId !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(body.listJobId) ||
+              typeof body.insightId !== 'string' || body.insightId.length > 2000 ||
+              !/^[A-Za-z0-9_+=:@.!-]+$/.test(body.insightId) || ['.', '..'].includes(body.insightId)) {
+            throw new HttpError(400, 'A valid list job and exact supported insight ID are required.');
+          }
+          detailPayload = selectedInsight(body.listJobId, body.insightId);
+          if (!detailPayload) throw new HttpError(403, 'The selected list result is unavailable or no longer belongs to the current authorized connection. No detail was requested.');
         }
         const payload = body.kind === 'meeting_notes' ? { notes: safeText(body.notes, 'Meeting notes', 8000, { required: true }) }
-          : body.kind === 'fake_demo' ? { confirmFakeOnly: true }
-            : body.kind === 'meeting_insight_list' ? listPayload : {};
+          : body.kind === 'fake_demo' ? { confirmFakeOnly: true, format: body.format }
+            : body.kind === 'meeting_insight_list' ? listPayload
+              : body.kind === 'meeting_insight_detail' ? detailPayload : {};
         const existingJob = store.state.jobs.find(item => item.requestId === body.requestId);
         let job;
         try {
@@ -1181,6 +1575,141 @@ export async function startServer({
         return;
       }
 
+      if (request.method === 'POST' && pathname === '/api/pipeline/snapshots/preview') {
+        const body = await readJson(request, MAX_PIPELINE_SNAPSHOT_BODY_BYTES);
+        assertOnlyKeys(body, new Set(['type', 'text']), 'Only a snapshot type and owner-pasted table are accepted.');
+        const preview = pipelineSnapshotCall(() => previewPipelineSnapshot(state.pipelineSnapshots, body.type, body.text));
+        jsonResponse(response, 200, preview);
+        return;
+      }
+
+      if (request.method === 'POST' && pathname === '/api/pipeline/snapshots/confirm') {
+        const body = await readJson(request, MAX_PIPELINE_SNAPSHOT_BODY_BYTES);
+        assertOnlyKeys(body, new Set(['type', 'text', 'revision', 'textHash', 'reviewed', 'requestId']), 'Only the reviewed pipeline snapshot preview is accepted.');
+        const result = updateState(next => {
+          const now = clock().toISOString();
+          const confirmed = pipelineSnapshotCall(() => confirmPipelineSnapshot(next, body, now));
+          if (confirmed.saved && !confirmed.deduplicated) {
+            recordActivity(next, 'local-pipeline-snapshot', `Saved owner-reviewed ${confirmed.snapshot.type} snapshot locally.`, now);
+          }
+          return confirmed;
+        });
+        jsonResponse(response, result.saved && !result.deduplicated ? 201 : 200, result);
+        return;
+      }
+
+      if (request.method === 'POST' && pathname === '/api/outcomes/export/status') {
+        const body = await readJson(request, MAX_OUTCOME_EXPORT_BODY_BYTES);
+        assertOnlyKeys(body, new Set(['requestId']), 'Only an existing local export request ID can be inspected.');
+        if (typeof body.requestId !== 'string' || !UUID_V4.test(body.requestId)) {
+          throw new HttpError(400, 'The local export request identifier is invalid.');
+        }
+        jsonResponse(response, 200, await inspectOutcomeExport(body.requestId));
+        return;
+      }
+
+      if (request.method === 'POST' && pathname === '/api/outcomes/export/resolve') {
+        const body = await readJson(request, MAX_OUTCOME_EXPORT_BODY_BYTES);
+        assertOnlyKeys(body, new Set(['requestId', 'inspected']), 'Only an explicitly inspected local export request can be resolved.');
+        if (typeof body.requestId !== 'string' || !UUID_V4.test(body.requestId) || body.inspected !== true) {
+          throw new HttpError(400, 'Confirm that Documents and Activity were inspected before resolving this request.');
+        }
+        const inspection = await inspectOutcomeExport(body.requestId);
+        if (inspection.status === 'running') throw new HttpError(409, 'The original workbook request is still running; its request marker was not cleared.');
+        updateState(next => {
+          if (outcomeExportOperations.has(body.requestId)) {
+            throw new HttpError(409, 'The original workbook request started again; its request marker was not cleared.');
+          }
+          const previousCount = next.outcomeExportRequests.length;
+          next.outcomeExportRequests = next.outcomeExportRequests.filter(item => item.requestId !== body.requestId);
+          if (next.outcomeExportRequests.length !== previousCount) {
+            recordActivity(next, 'local-outcomes-export-resolved', `Owner inspected and resolved the local XLSX request (${body.requestId}); no retry or deletion occurred.`, clock().toISOString());
+          }
+        });
+        jsonResponse(response, 200, { resolved: true, inspection });
+        return;
+      }
+
+      if (request.method === 'POST' && pathname === '/api/outcomes/export') {
+        const body = await readJson(request, MAX_OUTCOME_EXPORT_BODY_BYTES);
+        assertOnlyKeys(body, new Set(['requestId', 'snapshotHash', 'recordCount']), 'Only a reviewed local export request is accepted.');
+        if (typeof body.requestId !== 'string' || !UUID_V4.test(body.requestId) ||
+            typeof body.snapshotHash !== 'string' || !SHA256.test(body.snapshotHash) ||
+            !Number.isSafeInteger(body.recordCount) || body.recordCount < 0 || body.recordCount > 1000) {
+          throw new HttpError(400, 'The local export request is invalid.');
+        }
+        let operation = outcomeExportOperations.get(body.requestId);
+        const joined = Boolean(operation);
+        if (operation && (operation.snapshotHash !== body.snapshotHash || operation.recordCount !== body.recordCount)) {
+          throw new HttpError(409, 'This export request is already in progress for a different record set.');
+        }
+        if (!operation) {
+          operation = {
+            snapshotHash: body.snapshotHash,
+            recordCount: body.recordCount,
+            promise: createOrReuseOutcomeExport(body)
+          };
+          outcomeExportOperations.set(body.requestId, operation);
+        }
+        try {
+          const result = await operation.promise;
+          jsonResponse(response, 200, joined ? { ...result, reused: true } : result);
+        } finally {
+          if (outcomeExportOperations.get(body.requestId) === operation) outcomeExportOperations.delete(body.requestId);
+        }
+        return;
+      }
+
+      const sspMatch = /^\/api\/portfolio\/ssps\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/.exec(pathname);
+      if (request.method === 'POST' && sspMatch) {
+        const body = await readJson(request);
+        assertOnlyKeys(body, new Set(['title', 'accountIds', 'revision', 'requestId', 'confirmOwnerEntered']), 'Only an explicitly confirmed SSP label, account IDs, revision and request ID are accepted.');
+        const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+        if (body.confirmOwnerEntered !== true || typeof body.requestId !== 'string' || !uuid.test(body.requestId) ||
+            !Number.isSafeInteger(body.revision) || body.revision < 0 ||
+            !Array.isArray(body.accountIds) || body.accountIds.length > 50 ||
+            body.accountIds.some(id => typeof id !== 'string' || !uuid.test(id)) ||
+            new Set(body.accountIds).size !== body.accountIds.length) {
+          throw new HttpError(400, 'Confirm owner-entered context, a request UUID, account revision and at most 50 distinct exact account IDs.');
+        }
+        const title = safeText(body.title, 'Local SSP label', 100, { required: true });
+        const accountIds = [...body.accountIds].sort();
+        const result = updateState(next => {
+          if (accountIds.some(id => !next.records.some(record => record.id === id && record.category === 'account'))) {
+            throw new HttpError(400, 'Select only existing local account IDs. No name or affiliation matching is performed.');
+          }
+          for (const saved of next.records.filter(record => record.category === 'ssp')) {
+            const receipt = saved.history.find(item => item.requestId === body.requestId);
+            if (!receipt) continue;
+            if (saved.id !== sspMatch[1] || receipt.requestRevision !== body.revision || receipt.title !== title ||
+                JSON.stringify(receipt.accountIds) !== JSON.stringify(accountIds)) {
+              throw new HttpError(409, 'This SSP request ID belongs to another saved intent. Nothing was changed.');
+            }
+            return { record: saved, receipt, deduplicated: true };
+          }
+          let record = next.records.find(item => item.id === sspMatch[1]);
+          if (record && record.category !== 'ssp') throw new HttpError(409, 'This local ID belongs to a different record category.');
+          if ((record?.revision || 0) !== body.revision) throw new HttpError(409, 'The SSP record changed or is unavailable. Review the current directory before saving.');
+          if (!record && next.records.filter(item => item.category === 'ssp').length >= 200) throw new HttpError(409, 'The local SSP directory limit is 200 records; existing records were retained.');
+          if (record?.history.length >= 100) throw new HttpError(409, 'The local SSP history limit is 100 saves per record; existing history was retained.');
+          const now = clock().toISOString();
+          if (!record) {
+            record = { id: sspMatch[1], category: 'ssp', revision: 0, createdAt: now, history: [], provenance: 'owner-provided-unverified' };
+            next.records.unshift(record);
+          }
+          const receipt = {
+            id: randomUUID(), kind: 'local-ssp-saved', requestId: body.requestId, requestRevision: body.revision,
+            appliedRevision: record.revision + 1, title, accountIds, createdAt: now, provenance: 'owner-provided-unverified'
+          };
+          Object.assign(record, { title, accountIds, revision: receipt.appliedRevision, updatedAt: now });
+          record.history.push(receipt);
+          recordActivity(next, 'local-ssp', 'Saved explicitly owner-entered, unverified local SSP context; no identity or affiliation was verified.', now);
+          return { record, receipt, deduplicated: false };
+        });
+        jsonResponse(response, 201, result);
+        return;
+      }
+
       const recordMatch = /^\/api\/records\/([0-9a-f-]{36})$/.exec(pathname);
       if (request.method === 'PATCH' && recordMatch) {
         const body = await readJson(request, body => body?.category === 'account' ? MAX_ACCOUNT_BODY_BYTES : MAX_BODY_BYTES);
@@ -1188,9 +1717,63 @@ export async function startServer({
         const record = updateState(next => {
           const previous = next.records.find(item => item.id === recordMatch[1]);
           if (!previous) throw new HttpError(404, 'Local record not found.');
+          if (previous.category === 'ssp') throw new HttpError(400, 'Use the SSP directory editor with its request identity and account selections.');
           return saveLocalRecord(next, { ...body, id: previous.id }, clock().toISOString(), previous.category);
         });
         jsonResponse(response, 200, { record });
+        return;
+      }
+
+      const metricMatch = /^\/api\/records\/([0-9a-f-]{36})\/metrics$/.exec(pathname);
+      if (request.method === 'POST' && metricMatch) {
+        const body = await readJson(request);
+        assertOnlyKeys(body, new Set(['label', 'value', 'unit', 'date', 'revision', 'requestId', 'confirmOwnerEntered', 'duplicateOf', 'confirmSeparateObservation']), 'Only an explicitly confirmed local metric, separate-observation choice, account revision and request ID are accepted.');
+        if (typeof body.requestId !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(body.requestId) ||
+            !Number.isSafeInteger(body.revision) || body.revision < 0) {
+          throw new HttpError(400, 'A metric requires a request UUID and the displayed account revision.');
+        }
+        const values = localMetricValues(body);
+        const duplicateOf = body.duplicateOf === undefined ? '' : body.duplicateOf;
+        const confirmSeparateObservation = body.confirmSeparateObservation === undefined ? false : body.confirmSeparateObservation;
+        if (typeof duplicateOf !== 'string' || typeof confirmSeparateObservation !== 'boolean' ||
+            (duplicateOf ? !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(duplicateOf) || !confirmSeparateObservation : confirmSeparateObservation)) {
+          throw new HttpError(400, 'A separate identical observation requires explicit confirmation and the exact existing observation ID.');
+        }
+        const result = updateState(next => {
+          const record = next.records.find(item => item.id === metricMatch[1] && item.category === 'account');
+          if (!record) throw new HttpError(404, 'Choose an existing local account by its exact ID.');
+          for (const account of next.records.filter(item => item.category === 'account')) {
+            const prior = account.metrics?.find(item => item.requestId === body.requestId);
+            if (!prior) continue;
+            if (account.id !== record.id || prior.requestRevision !== body.revision ||
+                (prior.duplicateOf || '') !== duplicateOf || (prior.confirmSeparateObservation ?? false) !== confirmSeparateObservation ||
+                Object.entries(values).some(([key, value]) => prior[key] !== value)) {
+              throw new HttpError(409, 'This metric request ID already belongs to a different observation. Nothing was changed.');
+            }
+            return { record, metric: prior, deduplicated: true };
+          }
+          if (body.revision !== (record.revision || 0)) throw new HttpError(409, 'Local account changed. Refresh and review before adding a metric.');
+          const metrics = record.metrics ||= [];
+          const exact = metrics.filter(item => Object.entries(values).every(([key, value]) => item[key] === value));
+          if (duplicateOf) {
+            if (!exact.some(item => item.id === duplicateOf)) throw new HttpError(409, 'The separate-observation choice no longer matches an exact observation on this account. Review it again; nothing was added.');
+          } else if (exact.length) {
+            const existing = exact.at(-1);
+            throw new HttpError(409, `An exact local observation already exists: ${existing.label} = ${existing.value} ${existing.unit || '(unit not provided)'}, observation date ${existing.date || 'Unknown'}, recorded ${existing.createdAt}, ID ${existing.id}. Its original entry was retained. Review it and explicitly choose to record a separate observation; nothing was added.`);
+          }
+          if (metrics.length >= 200) throw new HttpError(409, 'This account has reached the local limit of 200 metric observations. Existing history was retained.');
+          const now = clock().toISOString();
+          const metric = {
+            id: randomUUID(), ...values, duplicateOf, confirmSeparateObservation, requestId: body.requestId, requestRevision: body.revision,
+            appliedRevision: (record.revision || 0) + 1, createdAt: now, provenance: 'owner-provided-unverified'
+          };
+          metrics.push(metric);
+          record.revision = metric.appliedRevision;
+          record.updatedAt = now;
+          recordActivity(next, 'local-account-metric', `Recorded an owner-entered, unverified metric for ${record.title}.`, now);
+          return { record, metric, deduplicated: false };
+        });
+        jsonResponse(response, 201, result);
         return;
       }
 
@@ -1242,7 +1825,8 @@ export async function startServer({
         const job = updateState(next => {
           const current = next.jobs.find(item => item.id === retryMatch[1]);
           if (!current) throw new HttpError(404, 'Job not found.');
-          if (current.kind === 'meeting_insight_list') throw new HttpError(409, 'Meeting insight lists require a new explicit consent in the list form; this job cannot be retried.');
+          if (['meeting_insight_list', 'meeting_insight_detail'].includes(current.kind)) throw new HttpError(409, 'Meeting insight reads require new explicit consent; this job cannot be retried.');
+          if (current.kind === 'fake_demo') throw new HttpError(409, 'Fake-only demos cannot be retried. Review the current approvals and make a fresh explicit request in the demo form.');
           if (!['partial', 'failed', 'interrupted'].includes(current.status)) throw new HttpError(409, 'Only partial, failed, or interrupted jobs may be retried.');
           if (current.kind === 'file_content_read' && current.status === 'partial') {
             throw new HttpError(409, 'This file read already completed; no additional download is available through retry.');
@@ -1331,6 +1915,91 @@ export async function startServer({
         return;
       }
 
+      const taskUndoMatch = /^\/api\/tasks\/([0-9a-f-]{36})\/undo$/.exec(pathname);
+      if (request.method === 'POST' && taskUndoMatch) {
+        const body = await readJson(request);
+        assertOnlyKeys(body, new Set(['eventId', 'revision', 'requestId']), 'Undo accepts only the recorded event, task revision and request ID.');
+        const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+        if (typeof body.eventId !== 'string' || !uuid.test(body.eventId) ||
+            typeof body.requestId !== 'string' || !uuid.test(body.requestId) ||
+            !Number.isInteger(body.revision) || body.revision < 1) {
+          throw new HttpError(400, 'Undo requires exact event/request UUIDs and the displayed task revision.');
+        }
+        const result = updateState(next => {
+          for (const task of next.tasks) {
+            const applied = task.history?.find(event => event.kind === 'undo-applied' && event.requestId === body.requestId);
+            if (!applied) continue;
+            if (task.id !== taskUndoMatch[1] || applied.eventId !== body.eventId || applied.requestRevision !== body.revision) {
+              throw new HttpError(409, 'This undo request ID was already used for a different action. Nothing was changed.');
+            }
+            return { ...taskUndoResult(task, applied), deduplicated: true };
+          }
+          const task = taskById(next, taskUndoMatch[1]);
+          const original = task.history?.find(event => event.id === body.eventId);
+          if (!original?.undoReceipt || !['status-changed', 'completed', 'reopened'].includes(original.kind) ||
+              task.history.some(event => event.kind === 'undo-applied' && event.eventId === original.id) ||
+              task.revision !== body.revision || task.revision !== original.undoReceipt.revision ||
+              task.status !== original.toStatus || (task.completedAt || null) !== original.undoReceipt.afterCompletedAt) {
+            throw new HttpError(409, 'This status change cannot be undone: the task changed, the receipt is unavailable, or it was already undone. Refresh and inspect history; nothing was changed.');
+          }
+          const now = clock().toISOString();
+          const fromStatus = task.status;
+          task.status = safeStatus(original.fromStatus);
+          task.completedAt = original.undoReceipt.beforeCompletedAt;
+          task.revision++;
+          task.updatedAt = now;
+          taskEvent(task, 'undo-applied', now, {
+            eventId: original.id, requestId: body.requestId, requestRevision: body.revision,
+            appliedRevision: task.revision, fromStatus, toStatus: task.status
+          });
+          recordActivity(next, 'task-undo', `Explicitly undid a local status change: ${task.title}`, now);
+          return taskUndoResult(task, task.history.at(-1));
+        });
+        jsonResponse(response, 200, result);
+        return;
+      }
+
+      const taskOwnerMatch = /^\/api\/tasks\/([0-9a-f-]{36})\/next-owner$/.exec(pathname);
+      if (request.method === 'POST' && taskOwnerMatch) {
+        const body = await readJson(request);
+        assertOnlyKeys(body, new Set(['nextOwner', 'revision']), 'Only a local next-owner label and task revision are accepted.');
+        if (typeof body.nextOwner !== 'string' || body.nextOwner.length > 250 ||
+            /[\u0000-\u001f\u007f]/.test(body.nextOwner) ||
+            (body.nextOwner.length > 0 && !body.nextOwner.trim()) ||
+            !Number.isSafeInteger(body.revision) || body.revision < 0 || body.revision >= Number.MAX_SAFE_INTEGER) {
+          throw new HttpError(400, 'Provide a next-owner label of at most 250 characters, or an empty string to clear it, and the displayed task revision.');
+        }
+        const observed = taskById(store.state, taskOwnerMatch[1]);
+        if (body.revision !== (observed.revision || 0)) throw new HttpError(409, 'Task changed. Refresh and review before saving the local next-owner label.');
+        const currentOwner = typeof observed.nextOwner === 'string' ? observed.nextOwner : '';
+        if (body.nextOwner === currentOwner) {
+          jsonResponse(response, 200, {
+            task: observed,
+            receipt: {
+              kind: 'next-owner-unchanged', status: 'unchanged', taskId: observed.id,
+              nextOwner: body.nextOwner, requestRevision: body.revision, appliedRevision: body.revision
+            }
+          });
+          return;
+        }
+        const task = updateState(next => {
+          const current = taskById(next, taskOwnerMatch[1]);
+          if (body.revision !== (current.revision || 0)) throw new HttpError(409, 'Task changed. Refresh and review before saving the local next-owner label.');
+          const now = clock().toISOString();
+          const previous = typeof current.nextOwner === 'string' ? current.nextOwner : null;
+          current.nextOwner = body.nextOwner;
+          current.revision = body.revision + 1;
+          current.updatedAt = now;
+          taskEvent(current, 'next-owner-changed', now, {
+            previous, nextOwner: body.nextOwner, requestRevision: body.revision, appliedRevision: current.revision
+          });
+          recordActivity(next, 'task-owner-context', `Updated local task context: ${current.title}`, now);
+          return current;
+        });
+        jsonResponse(response, 200, { task });
+        return;
+      }
+
       const taskMatch = /^\/api\/tasks\/([0-9a-f-]{36})$/.exec(pathname);
       if (request.method === 'PATCH' && taskMatch) {
         const body = await readJson(request);
@@ -1342,7 +2011,7 @@ export async function startServer({
         const task = await updateState(next => {
           const current = taskById(next, taskMatch[1]);
           if (!Number.isInteger(body.revision) || body.revision !== (current.revision || 0)) throw new HttpError(409, 'Task changed or its revision is missing. Refresh before updating; your edits were not applied.');
-          const previous = { title: current.title, details: current.details, status: current.status, priority: current.priority, dueDate: current.dueDate, accountId: current.accountId || '' };
+          const previous = { title: current.title, details: current.details, status: current.status, priority: current.priority, dueDate: current.dueDate, accountId: current.accountId || '', completedAt: current.completedAt || null };
           if (Object.hasOwn(body, 'title')) current.title = safeText(body.title, 'Title', 160, { required: true });
           if (Object.hasOwn(body, 'details')) current.details = safeText(body.details, 'Details', 3000);
           if (Object.hasOwn(body, 'status')) current.status = safeStatus(body.status);
@@ -1353,8 +2022,11 @@ export async function startServer({
           if (Object.hasOwn(body, 'dueDate')) current.dueDate = safeDate(body.dueDate);
           if (Object.hasOwn(body, 'accountId')) current.accountId = taskAccountId(next, body.accountId);
           if (current.status !== previous.status) {
-            taskEvent(current, current.status === 'done' ? 'completed' : previous.status === 'done' ? 'reopened' : 'status-changed', now, { fromStatus: previous.status, toStatus: current.status });
             current.completedAt = current.status === 'done' ? now : null;
+            taskEvent(current, current.status === 'done' ? 'completed' : previous.status === 'done' ? 'reopened' : 'status-changed', now, {
+              fromStatus: previous.status, toStatus: current.status,
+              undoReceipt: { revision: (current.revision || 0) + 1, beforeCompletedAt: previous.completedAt, afterCompletedAt: current.completedAt }
+            });
           }
           const fields = ['title', 'details', 'priority', 'dueDate', 'accountId'].filter(key => previous[key] !== (key === 'accountId' ? current.accountId || '' : current[key]));
           if (fields.length) taskEvent(current, 'updated', now, { fields });

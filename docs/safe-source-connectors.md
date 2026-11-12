@@ -202,6 +202,7 @@ continuation URLs and any further redirects are never followed.
 | `oneNote.read` | `GET /me/onenote/pages/{pageId}/content` | `Notes.Read` | Exact owner-selected page IDs only; first request is made through `/me`, capped by the adapter's existing 1 MiB response limit. HTML is inert, untrusted evidence. No notebook/page enumeration, metadata probe, continuation, attachments, images, or other resource fetches. |
 | `meetingInsights.read` | `GET /copilot/users/{verifiedOwnerId}/onlineMeetings/{meetingId}/aiInsights/{insightId}` | `OnlineMeetingAiInsight.Read.All` | Exact separately approved meeting/insight pairs only. Up to 50 entries and 20,000 characters per insight; truncation means partial coverage. AI-generated notes, action items, mentioned text and claimed owners are untrusted evidence, not assignments or instructions. |
 | `meetingInsightList.read` | `GET /copilot/users/{verifiedOwnerId}/onlineMeetings/{meetingId}/aiInsights` | `OnlineMeetingAiInsight.Read.All` | One meeting explicitly selected in `meetingInsightMeetings`. First page only, capped at 20 IDs and timestamps; no `$top` or continuation. This read does not authorize or fetch details. |
+| `meetingInsightSelection.read` | `GET /copilot/users/{verifiedOwnerId}/onlineMeetings/{meetingId}/aiInsights/{insightId}` | `OnlineMeetingAiInsight.Read.All` | One separately approved detail for a meeting authorized for listing. The trusted host must first validate the exact list result, owner, connection generation and per-read consent; the adapter itself does not establish list-result provenance. It does not modify configured source permissions. |
 | `files.read` | `GET /drives/{driveId}/items/{itemId}` | `Files.Read` | Exact approved OneDrive/SharePoint items, selected metadata only. `contentAvailable:false`; content and download URLs are not returned. Access may require a separately approved broader read permission or tenant/container configuration; denial stays visible. |
 | `files.readContent` | `GET /drives/{driveId}/items/{itemId}` before and after, `GET .../content` (manual 302), one credentialless pinned HTTPS request | `Files.Read` | One selected `text/plain` item only; requires `confirmRead:true`, exact owner-approved host match, stable eTag/size and host-approved direct egress. |
 | `mail.createReplyDraft` | `GET /me/messages/{sourceId}`, `POST /me/messages/{sourceId}/createReply` or `/createReplyAll`, `GET /me/messages/{draftId}` | `Mail.ReadWrite` | Explicit draft opt-in required; never sends. |
@@ -499,17 +500,28 @@ Always prioritize `outcomeUnknown` when presenting a draft failure.
   The API supports the global cloud only. The owner can separately select a
   meeting for listing and request one first page with explicit per-request consent;
   queued requests are bound to the current connection generation and fail after
-  disconnect, reconnect, shutdown or restart. The UI displays only historical
-  metadata; it cannot bind a chosen list result directly to detail consent. That
-  safe interactive selection workflow remains unimplemented. Detail reads still
-  require an independently configured meeting/insight pair and explicit source
-  consent; a list never expands this configuration. No `@odata.nextLink` is followed.
+  disconnect, reconnect, shutdown or restart. The owner can select a list item
+  from the current verified connection and separately approve one detail read.
+  Selection does not fetch detail, create tasks, or change configured sources.
+  The host checks the original list result, selected pair, owner, source consent
+  and connection generation before enqueue, before reading and before retaining
+  the result. Both jobs bind the core source-authorization fingerprint (current
+  consent generation and exact meeting-list selection); legacy lists without
+  that binding cannot authorize detail. Existing list health/inspected reporting
+  is preserved, and a selected detail does not imply broader source coverage.
+  Worker signals and connector checkpoints prevent further dispatch after
+  pause, quiet hours or shutdown. Post-read and pre-transition checkpoints
+  discard late insight results even if cancellation was ignored; successful
+  local-output semantics are unchanged.
+  IDs unsupported by the connector's strict path-segment validation
+  cannot be selected. Independently configured meeting/insight pairs remain
+  supported; a list never expands that configuration. No `@odata.nextLink` is followed.
   A shared list-health record verifies only one meeting. With multiple selected
   meetings, Connections conservatively remains `partial-access` even after
   separate successful lists; it does not accumulate proof across selections or
   automatically read the other meetings. The bounded limitation is visible.
-  Generic job retry is prohibited for lists. Every additional attempt requires a
-  new explicit list consent. The form blocks overlapping requests, identifies
+  Generic job retry is prohibited for lists and selected detail reads. Every
+  additional attempt requires new explicit consent. Each form blocks overlapping requests, identifies
   uncertain receipts, and asks the owner to check Activity before starting again.
   This temporary form guard is not retained across page reloads; after a reload,
   inspect Activity before giving new consent.

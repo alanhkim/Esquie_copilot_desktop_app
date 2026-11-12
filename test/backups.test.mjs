@@ -150,6 +150,44 @@ test('live snapshots recover verified documents and historical state into a sepa
   })).status, 401);
 });
 
+test('typed Markdown and Word documents survive verified backup and separate recovery', async t => {
+  const context = await setup(t);
+  await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
+  await context.queue('document');
+  await context.app.worker.tick();
+  await context.queue('word_document');
+  await context.app.worker.tick();
+  const state = await context.state();
+  const word = state.documents.find(document => document.format === 'docx');
+  assert.ok(word);
+  await context.queue('backup');
+  await context.app.worker.tick();
+  const backup = (await context.state()).backups[0];
+  assert.equal(backup.coverage.documents.includedCount, 2);
+  const original = await readFile(join(context.root, 'documents', `${word.id}.docx`));
+  const backupDirectory = join(context.root, 'backups', backup.id);
+  assert.deepEqual(await readFile(join(backupDirectory, 'documents', `${word.id}.docx`)), original);
+  const manifest = JSON.parse(await readFile(join(backupDirectory, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.documents.files.find(file => file.id === word.id).format, 'docx');
+
+  const response = await context.request(`/api/backups/${backup.id}/recover`, { confirmSeparateWorkspace: true });
+  assert.equal(response.status, 201);
+  const recovery = (await response.json()).recovery;
+  assert.deepEqual(await readFile(join(recovery.directory, 'documents', `${word.id}.docx`)), original);
+  const recovered = await startServer({ dataDir: recovery.directory, port: 0, workerIntervalMs: 0 });
+  try {
+    const restored = await (await fetch(`${recovered.url}/api/state`, {
+      headers: { 'X-Esquie-Access': recovered.accessToken }
+    })).json();
+    assert.equal(restored.documents.find(document => document.id === word.id).format, 'docx');
+    const details = await fetch(`${recovered.url}/api/documents/${word.id}`, {
+      headers: { 'X-Esquie-Access': recovered.accessToken }
+    });
+    assert.equal(details.status, 200, await details.clone().text());
+    assert.equal((await details.json()).format, 'docx');
+  } finally { await recovered.close(); }
+});
+
 test('missing recorded documents are reported and remain visibly unavailable in recovery', async t => {
   const context = await setup(t);
   await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
@@ -161,7 +199,7 @@ test('missing recorded documents are reported and remain visibly unavailable in 
   await context.app.worker.tick();
   const backup = (await context.state()).backups[0];
   assert.equal(backup.coverage.documents.status, 'partial');
-  assert.deepEqual(backup.coverage.documents.unavailable, [{ id: documentId, reason: 'Document file is missing.' }]);
+  assert.deepEqual(backup.coverage.documents.unavailable, [{ id: documentId, format: 'markdown', reason: 'Document file is missing.' }]);
   const response = await context.request(`/api/backups/${backup.id}/recover`, { confirmSeparateWorkspace: true });
   assert.equal(response.status, 201);
   const recovery = (await response.json()).recovery;
@@ -508,6 +546,45 @@ test('older state-only snapshots recover with document files marked unavailable'
     assert.match(restored.state.documents[0].fileUnavailableReason, /state-only/);
     assert.deepEqual(await readdir(directory), ['manifest.json', 'workspace.sqlite']);
   } finally { await restored.close(); await store.close(); }
+});
+
+test('typed backup recovery remains compatible with a version 1 Markdown inventory', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'esquie-backup-v1-compat-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const store = await openStore(root);
+  try {
+    const id = randomUUID();
+    const content = Buffer.from('Synthetic legacy Markdown workbook-independent fixture.');
+    const digest = createHash('sha256').update(content).digest('hex');
+    store.update(state => state.documents.push({
+      id, title: 'Version 1 compatibility', contentBytes: content.length, contentSha256: digest
+    }));
+    await mkdir(join(root, 'documents'), { mode: 0o700 });
+    await writeFile(join(root, 'documents', `${id}.md`), content, { mode: 0o600 });
+    const backup = await createLocalBackup({
+      root, store, id: randomUUID(), now: new Date('2026-03-04T10:00:00Z'),
+      verifyOutput: async () => {}, assertOutput: () => {}
+    });
+    const manifestPath = join(root, 'backups', backup.id, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+    manifest.documents = {
+      version: 1,
+      files: manifest.documents.files.map(({ id: fileId, sha256, bytes }) => ({ id: fileId, sha256, bytes })),
+      unavailable: manifest.documents.unavailable.map(({ id: fileId, reason }) => ({ id: fileId, reason }))
+    };
+    const manifestBytes = Buffer.from(JSON.stringify(manifest, null, 2));
+    await writeFile(manifestPath, manifestBytes, { mode: 0o600 });
+    backup.manifestSha256 = createHash('sha256').update(manifestBytes).digest('hex');
+    const recovery = await recoverLocalBackup({
+      root, backup, now: new Date('2026-03-04T11:00:00Z'),
+      verifyOutput: async () => {}, assertOutput: () => {}
+    });
+    const restored = await openStore(recovery.directory);
+    try {
+      assert.equal(restored.state.documents[0].fileUnavailableReason, undefined);
+      assert.deepEqual(await readFile(join(recovery.directory, 'documents', `${id}.md`)), content);
+    } finally { await restored.close(); }
+  } finally { await store.close(); }
 });
 
 test('daily backup attempts respect quiet hours, pause, restart and failures without repeated daily writes or pruning', async t => {

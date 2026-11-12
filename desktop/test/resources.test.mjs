@@ -15,8 +15,12 @@ test('literal runtime resource allowlist forms a standalone backend without Elec
     { from: '../public', to: 'workspace/public' }
   ]);
   assert.ok(resources.find(resource => resource.to === 'workspace/public').filter.includes('task-board.mjs'));
+  assert.ok(resources.find(resource => resource.to === 'workspace/public').filter.includes('completed-work.mjs'));
   assert.ok(resources.find(resource => resource.to === 'workspace/src').filter.includes('connectors/safe-file-download.mjs'));
   assert.ok(resources.find(resource => resource.to === 'workspace/src').filter.includes('windows-ocr.mjs'));
+  assert.ok(resources.find(resource => resource.to === 'workspace/src').filter.includes('fake-demo-pptx.mjs'));
+  assert.ok(resources.find(resource => resource.to === 'workspace/src').filter.includes('document-format.mjs'));
+  assert.ok(resources.find(resource => resource.to === 'workspace/src').filter.includes('word-document.mjs'));
   for (const resource of resources) {
     assert.ok(Array.isArray(resource.filter) && resource.filter.length > 0);
     for (const file of resource.filter) {
@@ -39,10 +43,26 @@ test('literal runtime resource allowlist forms a standalone backend without Elec
     assert.equal((await fetch(`${app.url}/api/health`)).ok, true);
     assert.equal((await fetch(`${app.url}/api/state`)).status, 401);
     assert.equal((await fetch(`${app.url}/api/state`, { headers: { 'X-Esquie-Access': app.accessToken } })).ok, true);
-    for (const asset of ['/', '/app.js', '/styles.css', '/task-board.mjs', '/account-search.mjs', '/account-workspace.mjs', '/outcome-import-workflow.mjs']) {
+    for (const asset of ['/', '/app.js', '/styles.css', '/task-board.mjs', '/completed-work.mjs', '/account-search.mjs', '/account-workspace.mjs', '/outcome-import-workflow.mjs', '/outcome-export-workflow.mjs', '/pipeline-snapshots.mjs', '/portfolio-workspace.mjs']) {
       const response = await fetch(`${app.url}${asset}`);
       assert.equal(response.ok, true, asset);
+      if (asset === '/' || asset === '/app.js') {
+        const content = await response.text();
+        assert.equal(content, await readFile(resolve(desktop, '..', 'public', asset === '/' ? 'index.html' : 'app.js'), 'utf8'));
+        assert.match(content, /generic-queue-inspect/);
+        assert.match(content, /generic-queue-retry/);
+        assert.match(content, /demo-recovery/);
+        assert.match(content, /demo-allow-new/);
+        assert.match(content, /fingerprint/);
+        if (asset === '/app.js') {
+          assert.match(content, /esquie-generic-queue-request-v1/);
+          assert.match(content, /SHA-256/);
+        } else {
+          assert.match(content, /same-tab, same-origin reload/);
+        }
+      }
       if (asset.endsWith('.mjs')) {
+        assert.match(response.headers.get('content-type'), /^text\/javascript(?:;|$)/);
         assert.deepEqual(
           Buffer.from(await response.arrayBuffer()),
           await readFile(resolve(desktop, '..', 'public', asset.slice(1))),

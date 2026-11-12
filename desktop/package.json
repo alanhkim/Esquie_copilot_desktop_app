@@ -33,12 +33,12 @@
     ],
     "extraResources": [
       { "from": "../src", "to": "workspace/src", "filter": [
-        "server.mjs", "store.mjs", "worker.mjs", "backups.mjs", "monthly-outcomes-import.mjs",
-        "local-output.mjs", "private-storage.mjs", "windows-ocr.mjs",
+        "server.mjs", "store.mjs", "worker.mjs", "backups.mjs", "document-format.mjs", "word-document.mjs", "monthly-outcomes-import.mjs", "monthly-outcomes-xlsx.mjs", "pipeline-snapshots.mjs",
+        "local-output.mjs", "private-storage.mjs", "windows-ocr.mjs", "fake-demo-pptx.mjs",
         "assistant/bridge.mjs", "connectors/microsoft365.mjs", "connectors/safe-file-download.mjs"
       ] },
       { "from": "../public", "to": "workspace/public", "filter": [
-        "index.html", "styles.css", "app.js", "task-board.mjs", "account-search.mjs", "account-workspace.mjs", "outcome-import-workflow.mjs"
+        "index.html", "styles.css", "app.js", "task-board.mjs", "completed-work.mjs", "account-search.mjs", "account-workspace.mjs", "outcome-import-workflow.mjs", "outcome-export-workflow.mjs", "pipeline-snapshots.mjs", "portfolio-workspace.mjs"
       ] }
     ],
     "win": {

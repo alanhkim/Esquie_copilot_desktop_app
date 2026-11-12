@@ -425,6 +425,22 @@ test('meeting list reports truncation independently for oversized pages and cont
   }
 });
 
+test('one selected insight needs explicit detail consent and never alters configured source permissions', async () => {
+  const h = harness({ handle: async url => {
+    assert.equal(url.pathname, '/v1.0/copilot/users/fake-owner/onlineMeetings/meeting/aiInsights/selected');
+    return Response.json({ id: 'selected', meetingNotes: [{ text: 'Synthetic evidence' }] });
+  } });
+  await h.connect({ sources: { meetingInsightMeetings: ['meeting'] } });
+  await assert.rejects(h.adapter.connectors.meetingInsightSelection.read({ meetingId: 'meeting', insightId: 'selected' }), code('consent_required'));
+  await assert.rejects(h.adapter.connectors.meetingInsightSelection.read({ meetingId: 'other', insightId: 'selected', consent: true }), code('source_not_authorized'));
+  assert.equal(h.calls.length, 1);
+  const result = await h.adapter.connectors.meetingInsightSelection.read({ meetingId: 'meeting', insightId: 'selected', consent: true });
+  assert.equal(result.items[0].content, 'Meeting note: Synthetic evidence');
+  assert.deepEqual(h.tokenCalls.at(-1).scopes, ['User.Read', 'OnlineMeetingAiInsight.Read.All']);
+  await assert.rejects(h.adapter.connectors.meetingInsights.read(), code('source_not_authorized'));
+  assert.equal(h.calls.length, 3);
+});
+
 test('bounded mail reads preserve untrusted evidence and never follow nextLink', async () => {
   const h = harness({
     handle: async () => Response.json({

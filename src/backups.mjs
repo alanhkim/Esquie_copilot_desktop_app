@@ -4,16 +4,25 @@ import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { openRecoveredSnapshot } from './store.mjs';
+import { documentFileName, documentFormat } from './document-format.mjs';
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const digest = /^[0-9a-f]{64}$/;
-const maxDocumentBytes = 1024 * 1024;
+export const MAX_LOCAL_DOCUMENT_BYTES = 1024 * 1024;
+const maxDocumentBytes = MAX_LOCAL_DOCUMENT_BYTES;
 const maxTotalDocumentBytes = 16 * 1024 * 1024;
 const maxDocuments = 1000;
 const maxSnapshotBytes = 256 * 1024 * 1024;
 const maxManifestBytes = 1024 * 1024;
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const writeOpenFile = promisify(writeFileCallback);
+
+function documentFile(document) {
+  const format = documentFormat(document);
+  return { format, fileName: documentFileName(document) };
+}
+
+const documentName = document => documentFile(document).fileName;
 
 async function localDirectory(path, { exclusive = false, create = true, volume, assertOutput } = {}) {
   if (create) {
@@ -75,11 +84,19 @@ async function readVerifiedFile(path, limit, volume) {
   } finally { await file.close(); }
 }
 
+export async function readVerifiedLocalFile(path, { limit = maxDocumentBytes, volume } = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 0 || volume === undefined) {
+    throw new Error('A local file size and volume boundary are required.');
+  }
+  return readVerifiedFile(path, limit, volume);
+}
+
 function validateDocuments(documents) {
   if (!Array.isArray(documents) || documents.length > maxDocuments) throw new Error('Too many document records for a backup.');
   const seen = new Set();
   for (const document of documents) {
     if (!document || !uuid.test(document.id) || seen.has(document.id.toLowerCase())) throw new Error('Invalid or duplicate document record.');
+    documentFile(document);
     seen.add(document.id.toLowerCase());
   }
 }
@@ -95,22 +112,25 @@ async function collectDocuments(root, documents, volume) {
     if (error.code !== 'ENOENT') throw error;
     names = [];
   }
-  const expected = new Set(documents.map(document => `${document.id}.md`));
+  const descriptors = new Map(documents.map(document => [document.id, documentFile(document)]));
+  const expected = new Set([...descriptors.values()].map(item => item.fileName));
   if (names.some(name => !expected.has(name))) throw new Error('Unknown document files were not included.');
   const files = [];
   const unavailable = [];
   let total = 0;
   for (const document of documents) {
-    const name = `${document.id}.md`;
+    const descriptor = descriptors.get(document.id);
+    const name = descriptor.fileName;
+    const typed = { id: document.id, ...descriptor };
     if (!names.includes(name)) {
-      unavailable.push({ id: document.id, reason: 'Document file is missing.' });
+      unavailable.push({ ...typed, reason: 'Document file is missing.' });
       continue;
     }
     const path = join(directory, name);
     await fileMetadata(path, volume);
     if (document.fileUnavailableReason || !digest.test(document.contentSha256 || '') ||
         !Number.isSafeInteger(document.contentBytes) || document.contentBytes < 0) {
-      unavailable.push({ id: document.id, reason: 'Document content has no verified generation record or was already unavailable.' });
+      unavailable.push({ ...typed, reason: 'Document content has no verified generation record or was already unavailable.' });
       continue;
     }
     const bytes = await readVerifiedFile(path, maxDocumentBytes, volume);
@@ -119,16 +139,16 @@ async function collectDocuments(root, documents, volume) {
     }
     total += bytes.length;
     if (total > maxTotalDocumentBytes) throw new Error('Documents exceed the supported backup size limit.');
-    files.push({ id: document.id, sha256: document.contentSha256, bytes: bytes.length, content: bytes });
+    files.push({ ...typed, sha256: document.contentSha256, bytes: bytes.length, content: bytes });
   }
   return { files, unavailable };
 }
 
 function inventory(collected) {
   return {
-    version: 1,
-    files: collected.files.map(({ id, sha256, bytes }) => ({ id, sha256, bytes })),
-    unavailable: collected.unavailable
+    version: 2,
+    files: collected.files.map(({ id, format, fileName, sha256, bytes }) => ({ id, format, fileName, sha256, bytes })),
+    unavailable: collected.unavailable.map(({ id, format, fileName, reason }) => ({ id, format, fileName, reason }))
   };
 }
 
@@ -164,7 +184,7 @@ export async function createLocalBackup({ root, store, id, now, verifyOutput, as
     const folder = join(directory, 'documents');
     await localDirectory(folder, { exclusive: true, volume, assertOutput });
     for (const file of collected.files) {
-      const target = join(folder, `${file.id}.md`);
+      const target = join(folder, file.fileName);
       await writeNewFile(target, file.content, assertOutput);
       if (hash(await readVerifiedFile(target, maxDocumentBytes, volume)) !== file.sha256) throw new Error('Document backup verification failed.');
     }
@@ -177,7 +197,7 @@ export async function createLocalBackup({ root, store, id, now, verifyOutput, as
       documents: {
         status: collected.unavailable.length ? 'partial' : 'included',
         metadataCount: documents.length, includedCount: collected.files.length,
-        unavailable: collected.unavailable
+        unavailable: collected.unavailable.map(({ id, format, reason }) => ({ id, format, reason }))
       },
       sources: 'partial-local-evidence-only; disconnected/unavailable sources are not checkpoints'
     }
@@ -209,7 +229,8 @@ export async function recoverLocalBackup({ root, backup, now, verifyOutput, asse
     throw new Error('Backup integrity verification failed; recovery was refused.');
   }
   const modern = backup.manifestSha256 !== undefined;
-  if (modern && (!digest.test(backup.manifestSha256) || manifest.documents?.version !== 1)) throw new Error('Backup document manifest is invalid.');
+  const documentVersion = manifest.documents?.version;
+  if (modern && (!digest.test(backup.manifestSha256) || ![1, 2].includes(documentVersion))) throw new Error('Backup document manifest is invalid.');
   if (!modern && manifest.documents !== undefined) throw new Error('Unverified document manifest was refused.');
   const restoredFiles = new Map();
   let excluded = [];
@@ -217,27 +238,40 @@ export async function recoverLocalBackup({ root, backup, now, verifyOutput, asse
     const entries = manifest.documents;
     if (!Array.isArray(entries.files) || !Array.isArray(entries.unavailable) ||
         entries.files.length + entries.unavailable.length > maxDocuments) throw new Error('Invalid document inventory.');
-    const all = [...entries.files, ...entries.unavailable];
+    const normalizeEntry = item => {
+      if (documentVersion === 1) {
+        const format = item.format || 'markdown';
+        if (!['markdown', 'pptx'].includes(format)) throw new Error('Invalid document inventory.');
+        return { ...item, format, fileName: `${item.id}.${format === 'pptx' ? 'pptx' : 'md'}` };
+      }
+      if (!['markdown', 'docx', 'pptx', 'xlsx'].includes(item.format)) throw new Error('Invalid typed document inventory.');
+      const expectedName = documentFile({ id: item.id, format: item.format }).fileName;
+      if (item.fileName !== expectedName) throw new Error('Invalid typed document filename.');
+      return item;
+    };
+    const files = entries.files.map(normalizeEntry);
+    const unavailable = entries.unavailable.map(normalizeEntry);
+    const all = [...files, ...unavailable];
     validateDocuments(all);
-    if (entries.unavailable.some(item => typeof item.reason !== 'string' || item.reason.length > 200)) throw new Error('Invalid document exclusions.');
+    if (unavailable.some(item => typeof item.reason !== 'string' || item.reason.length > 200)) throw new Error('Invalid document exclusions.');
     let total = 0;
-    for (const file of entries.files) {
+    for (const file of files) {
       if (!digest.test(file.sha256 || '') || !Number.isSafeInteger(file.bytes) || file.bytes < 0 || file.bytes > maxDocumentBytes) throw new Error('Invalid document inventory.');
       total += file.bytes;
     }
     if (total > maxTotalDocumentBytes) throw new Error('Documents exceed the supported recovery size limit.');
-    const names = ['manifest.json', 'workspace.sqlite', ...(entries.files.length ? ['documents'] : [])];
+    const names = ['manifest.json', 'workspace.sqlite', ...(files.length ? ['documents'] : [])];
     await directoryEntries(directory, names, volume);
-    if (entries.files.length) {
+    if (files.length) {
       const folder = join(directory, 'documents');
-      await directoryEntries(folder, entries.files.map(file => `${file.id}.md`), volume);
-      for (const file of entries.files) {
-        const content = await readVerifiedFile(join(folder, `${file.id}.md`), maxDocumentBytes, volume);
+      await directoryEntries(folder, files.map(file => file.fileName), volume);
+      for (const file of files) {
+        const content = await readVerifiedFile(join(folder, file.fileName), maxDocumentBytes, volume);
         if (content.length !== file.bytes || hash(content) !== file.sha256) throw new Error('Document backup integrity verification failed.');
         restoredFiles.set(file.id, { ...file, content });
       }
     }
-    excluded = entries.unavailable;
+    excluded = unavailable;
   } else {
     await directoryEntries(directory, ['manifest.json', 'workspace.sqlite'], volume);
   }
@@ -256,7 +290,12 @@ export async function recoverLocalBackup({ root, backup, now, verifyOutput, asse
         if (expected.size !== state.documents.length || state.documents.some(document => !expected.has(document.id))) throw new Error('Document inventory does not match the saved workspace.');
         for (const document of state.documents) {
           const file = restoredFiles.get(document.id);
-          if (file && (document.contentSha256 !== file.sha256 || document.contentBytes !== file.bytes || document.fileUnavailableReason)) throw new Error('Document inventory does not match its saved record.');
+          const listed = file || excluded.find(item => item.id === document.id);
+          const descriptor = documentFile(document);
+          if (!listed || descriptor.format !== listed.format || descriptor.fileName !== listed.fileName ||
+              (file && (document.contentSha256 !== file.sha256 || document.contentBytes !== file.bytes || document.fileUnavailableReason))) {
+            throw new Error('Document inventory does not match its saved record.');
+          }
         }
       }
       Object.assign(state.preferences, { paused: true, automaticRefresh: false, dailyBackups: false, localOutputApproved: false, demoApproved: false });
@@ -281,7 +320,7 @@ export async function recoverLocalBackup({ root, backup, now, verifyOutput, asse
       const folder = join(destination, 'documents');
       await localDirectory(folder, { exclusive: true, volume, assertOutput });
       for (const file of restoredFiles.values()) {
-        const target = join(folder, `${file.id}.md`);
+        const target = join(folder, file.fileName);
         await writeNewFile(target, file.content, assertOutput);
         if (hash(await readVerifiedFile(target, maxDocumentBytes, volume)) !== file.sha256) throw new Error('Recovered document verification failed.');
       }

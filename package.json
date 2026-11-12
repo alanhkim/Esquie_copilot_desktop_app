@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node --experimental-vm-modules --test test/*.test.mjs",
+    "test": "node --experimental-vm-modules --test --test-concurrency=1 --test-timeout=1200000 test/*.test.mjs",
     "smoke": "node scripts/smoke.mjs",
     "smoke:upgrade": "node scripts/upgrade-smoke.mjs"
   }

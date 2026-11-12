@@ -19,7 +19,7 @@ export function newWorkspace() {
     schemaVersion: 1,
     profile: { displayName: '', timezone: '' },
     preferences: { paused: false, quietStart: '', quietEnd: '', automaticRefresh: false, dailyBackups: false, localOutputApproved: false, demoApproved: false },
-    tasks: [], drafts: [], links: [], activity: [], conversations: [], jobs: [], documents: [], records: [], draftOperations: [], backups: [], recoveries: [],
+    tasks: [], drafts: [], links: [], activity: [], conversations: [], jobs: [], documents: [], records: [], pipelineSnapshots: [], draftOperations: [], backups: [], recoveries: [], outcomeExportRequests: [],
     sourceConsent: null,
     sourceConfigurationDraft: null,
     onboarding: { status: 'not-started', step: 0, revision: 0, updatedAt: null, legacy: false },
@@ -45,10 +45,23 @@ function normalizeState(value) {
     if (task.history != null && !Array.isArray(task.history)) throw new Error('Saved task history is invalid; the workspace was left unchanged.');
     task.history ??= [];
   }
-  for (const key of ['links', 'conversations', 'jobs', 'documents', 'records', 'draftOperations', 'backups', 'recoveries']) {
+  for (const key of ['links', 'conversations', 'jobs', 'documents', 'records', 'pipelineSnapshots', 'draftOperations', 'backups', 'recoveries', 'outcomeExportRequests']) {
     if (!Array.isArray(state[key])) throw new Error(`Saved ${key} is invalid; the workspace was left unchanged.`);
   }
+  if (state.outcomeExportRequests.length > 1000) throw new Error('Saved outcome export requests exceed the supported limit.');
+  const exportRequestIds = new Set();
+  for (const request of state.outcomeExportRequests) {
+    if (!request || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.requestId || '') ||
+        exportRequestIds.has(request.requestId.toLowerCase()) ||
+        !/^[0-9a-f]{64}$/i.test(request.snapshotHash || '') ||
+        !Number.isSafeInteger(request.recordCount) || request.recordCount < 0 || request.recordCount > 1000 ||
+        typeof request.createdAt !== 'string' || !Number.isFinite(Date.parse(request.createdAt))) {
+      throw new Error('Saved outcome export request is invalid; the workspace was left unchanged.');
+    }
+    exportRequestIds.add(request.requestId.toLowerCase());
+  }
   for (const record of state.records) {
+    if (record.category === 'ssp' && (!Array.isArray(record.history) || !Array.isArray(record.accountIds))) throw new Error('Saved local SSP context is invalid; the workspace was left unchanged.');
     if (record.category !== 'account') continue;
     if (record.history != null && !Array.isArray(record.history)) throw new Error('Saved account history is invalid; the workspace was left unchanged.');
     record.history ??= [];

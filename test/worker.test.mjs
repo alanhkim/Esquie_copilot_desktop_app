@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { copyFile, link, mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
@@ -10,7 +10,8 @@ import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { startServer } from '../src/server.mjs';
 import { createWorker, enqueue, quietHoursActive } from '../src/worker.mjs';
-import { newWorkspace } from '../src/store.mjs';
+import { newWorkspace, openStore } from '../src/store.mjs';
+import { monthlyOutcomesSnapshotHash } from '../public/outcome-export-workflow.mjs';
 
 const sourceIdentity = { tenantId: 'synthetic-tenant', userId: 'synthetic-owner' };
 const chatSelection = {
@@ -33,6 +34,119 @@ function deferred() {
   return { promise, resolve };
 }
 
+test('insight results are discarded after cancellation at read completion or retention', async t => {
+  for (const kind of ['meeting_insight_list', 'meeting_insight_detail']) {
+    for (const boundary of ['read completion', 'retention']) {
+      for (const action of ['paused', 'quiet_hours', 'shutdown']) {
+        await t.test(`${kind}: ${boundary}: ${action}`, async () => {
+          let now = new Date('2026-11-11T11:00:00Z');
+          const state = {
+            preferences: { paused: false, quietStart: '12:00', quietEnd: '13:00' },
+            profile: { timezone: 'UTC' }, scheduler: {}, jobs: []
+          };
+          const store = { state, update: change => change(state) };
+          enqueue(state, { kind, requestId: randomUUID(), payload: {
+            meetingId: 'synthetic-meeting', insightId: 'synthetic-insight',
+            connectionEpoch: 'synthetic-epoch', ownerReference: JSON.stringify(sourceIdentity),
+            authorizationReference: 'synthetic-authorization'
+          } }, now);
+          const active = deferred();
+          const finish = deferred();
+          let signal;
+          let stopping;
+          const stop = () => {
+            if (action === 'paused') state.preferences.paused = true;
+            else if (action === 'quiet_hours') now = new Date('2026-11-11T12:05:00Z');
+            else stopping = worker.stop();
+          };
+          const result = {
+            verifiedOwner: true,
+            items: [{ id: 'synthetic-insight', content: 'Must not be retained.' }],
+            get coverage() {
+              if (boundary === 'retention') stop();
+              return { status: 'partial' };
+            }
+          };
+          const connector = { read: async options => {
+            signal = options.signal;
+            active.resolve();
+            await finish.promise;
+            return result; // Intentionally ignores cancellation.
+          } };
+          const health = [];
+          const worker = createWorker({
+            store, intervalMs: 0, clock: () => now,
+            sourceIdentity: () => sourceIdentity, sourceEpoch: () => 'synthetic-epoch',
+            sourceAuthorization: () => 'synthetic-authorization',
+            insightSelectionCurrent: () => true,
+            insightListConnector: connector, insightSelectionConnector: connector,
+            onSourceResult: result => health.push(result)
+          });
+          try {
+            const tick = worker.tick();
+            await active.promise;
+            if (boundary === 'read completion') stop();
+            finish.resolve();
+            await tick;
+            if (stopping) await stopping;
+            assert.equal(signal.aborted, true);
+            assert.equal(state.jobs[0].status, 'failed');
+            assert.equal(state.jobs[0].result, null);
+            assert.match(state.jobs[0].error, new RegExp(action));
+            if (kind === 'meeting_insight_list') assert.equal(health.at(-1).status, 'deferred');
+          } finally {
+            finish.resolve();
+            await worker.stop();
+          }
+        });
+      }
+    }
+  }
+});
+
+test('meeting list authorization changes reject queued, in-flight and late results', async t => {
+  for (const boundary of ['queued', 'read completion', 'retention']) {
+    await t.test(boundary, async () => {
+      let authorization = 'original-authorization';
+      const state = {
+        preferences: { paused: false, quietStart: '', quietEnd: '' },
+        profile: { timezone: 'UTC' }, scheduler: {}, jobs: []
+      };
+      enqueue(state, { kind: 'meeting_insight_list', requestId: randomUUID(), payload: {
+        meetingId: 'synthetic-meeting', connectionEpoch: 'synthetic-epoch',
+        ownerReference: JSON.stringify(sourceIdentity), authorizationReference: authorization
+      } });
+      let reads = 0;
+      const health = [];
+      const worker = createWorker({
+        store: { state, update: change => change(state) }, intervalMs: 0,
+        sourceIdentity: () => sourceIdentity, sourceEpoch: () => 'synthetic-epoch',
+        sourceAuthorization: () => authorization,
+        insightListConnector: { read: async () => {
+          reads++;
+          if (boundary === 'read completion') authorization = 'changed-authorization';
+          return {
+            verifiedOwner: true, items: [{ id: 'synthetic-insight' }],
+            get coverage() {
+              if (boundary === 'retention') authorization = 'changed-authorization';
+              return { status: 'partial' };
+            }
+          };
+        } },
+        onSourceResult: result => health.push(result)
+      });
+      try {
+        if (boundary === 'queued') authorization = 'changed-authorization';
+        await worker.tick();
+        assert.equal(reads, boundary === 'queued' ? 0 : 1);
+        assert.equal(state.jobs[0].status, 'failed');
+        assert.equal(state.jobs[0].result, null);
+        assert.equal(health.at(-1).status, 'deferred');
+      } finally { await worker.stop(); }
+    });
+  }
+});
+
 async function setup(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'esquie-queue-'));
   let app = await startServer({ dataDir: root, port: 0, workerIntervalMs: 0, verifyLocalVolume: async () => true, ...options });
@@ -44,6 +158,14 @@ async function setup(t, options = {}) {
     get app() { return app; },
     async restart() {
       await app.close();
+      app = await startServer({ dataDir: root, port: 0, workerIntervalMs: 0, verifyLocalVolume: async () => true, ...options });
+      token = (await (await readState()).json()).csrfToken;
+    },
+    async updateSavedState(change) {
+      await app.close();
+      const store = await openStore(root);
+      try { store.update(change); }
+      finally { await store.close(); }
       app = await startServer({ dataDir: root, port: 0, workerIntervalMs: 0, verifyLocalVolume: async () => true, ...options });
       token = (await (await readState()).json()).csrfToken;
     },
@@ -326,7 +448,8 @@ test('meeting list retention rejects stale authorization and late results after 
     });
     t.after(async () => { release.resolve(); await worker.stop(); });
     const job = enqueue(state, { kind: 'meeting_insight_list', requestId: randomUUID(), payload: {
-      meetingId: 'synthetic-meeting', ownerReference: JSON.stringify(owner), connectionEpoch: epoch
+      meetingId: 'synthetic-meeting', ownerReference: JSON.stringify(owner), connectionEpoch: epoch,
+      authorizationReference: authorization
     } });
     const next = enqueue(state, { kind: 'source_refresh', requestId: randomUUID() });
     const running = worker.tick();
@@ -480,6 +603,287 @@ test('local document jobs use generated contained filenames and keep notes out o
   assert.equal((await context.request('/api/jobs', { kind: 'document', requestId: randomUUID(), path: '../escape.md' })).status, 400);
 });
 
+test('approved Word summaries preserve local task text and expose only a verified local-file reference', async t => {
+  const context = await setup(t);
+  assert.equal((await context.request('/api/output-approval', { confirmPrivateNonSynced: true })).status, 200);
+  const task = (await (await context.request('/api/tasks', {
+    title: 'Synthetic <task> with line break\nSecond line',
+    details: 'Owner-provided detail & untrusted text',
+    dueDate: '2026-11-12'
+  })).json()).task;
+  const queued = await context.request('/api/jobs', { kind: 'word_document', taskId: task.id, requestId: randomUUID() });
+  assert.equal(queued.status, 202);
+  const { job } = await queued.json();
+  await context.app.worker.tick();
+  const state = await context.state();
+  assert.equal(state.jobs.find(item => item.id === job.id).status, 'completed');
+  const document = state.documents.find(item => item.id === job.id);
+  assert.equal(document.format, 'docx');
+  const path = join(context.root, 'documents', `${job.id}.docx`);
+  const bytes = await readFile(path);
+  assert.equal(bytes.readUInt32LE(0), 0x04034b50);
+  assert.equal(document.contentBytes, bytes.length);
+  assert.equal(document.contentSha256, createHash('sha256').update(bytes).digest('hex'));
+  const detail = await context.request(`/api/documents/${job.id}`, undefined, 'GET');
+  assert.equal(detail.status, 200, await detail.clone().text());
+  const body = await detail.json();
+  assert.equal(body.format, 'docx');
+  assert.equal(body.contentBytes, bytes.length);
+  assert.match(body.text, /Verified local Word file/);
+  assert.doesNotMatch(JSON.stringify(body), /Owner-provided detail/);
+  await context.restart();
+  const afterRestart = await context.request(`/api/documents/${job.id}`, undefined, 'GET');
+  assert.equal(afterRestart.status, 200, await afterRestart.clone().text());
+  assert.equal((await afterRestart.json()).contentSha256, document.contentSha256);
+});
+
+test('real Word worker preserves supplementary Unicode and visible line breaks before and after restart', async t => {
+  const context = await setup(t);
+  assert.equal((await context.request('/api/output-approval', { confirmPrivateNonSynced: true })).status, 200);
+  const title = 'Synthetic multilingual title \u{1F9ED}\r\nSecond line\rThird line\nFourth\tline';
+  const details = 'Synthetic detail \u{1F30D}\r\nSecond detail\rThird detail\nFourth\tdetail';
+  const response = await context.request('/api/tasks', { title, details });
+  assert.equal(response.status, 201);
+  const { task } = await response.json();
+
+  for (const persisted of [false, true]) {
+    if (persisted) await context.restart();
+    const queued = await context.request('/api/jobs', {
+      kind: 'word_document', taskId: task.id, requestId: randomUUID()
+    });
+    assert.equal(queued.status, 202);
+    const { job } = await queued.json();
+    await context.app.worker.tick();
+    const state = await context.state();
+    assert.equal(state.jobs.find(item => item.id === job.id).status, 'completed');
+    const document = state.documents.find(item => item.id === job.id);
+    const bytes = await readFile(join(context.root, 'documents', `${job.id}.docx`));
+    const xml = bytes.toString('utf8');
+    assert.ok(bytes.includes(Buffer.from('\u{1F9ED}', 'utf8')));
+    assert.ok(bytes.includes(Buffer.from('\u{1F30D}', 'utf8')));
+    const paragraphs = [...xml.matchAll(/<w:p>[\s\S]*?<\/w:p>/g)].map(([paragraph]) => paragraph);
+    const visibleText = paragraph => [...paragraph.matchAll(/<w:t xml:space="preserve">([\s\S]*?)<\/w:t>|<w:tab\/>|<w:br\/>/g)]
+      .map(([token, text]) => token === '<w:tab/>' ? '\t' : token === '<w:br/>' ? '\n' : text)
+      .join('');
+    const titleParagraph = paragraphs.find(paragraph => paragraph.includes('Synthetic multilingual title'));
+    assert.ok(titleParagraph);
+    assert.equal(visibleText(titleParagraph), `Synthetic multilingual title \u{1F9ED}\nSecond line\nThird line\nFourth\tline [next]`);
+    const detailsIndex = paragraphs.findIndex(paragraph => paragraph.includes('Synthetic detail'));
+    assert.deepEqual(paragraphs.slice(detailsIndex, detailsIndex + 4).map(visibleText), [
+      `Synthetic detail \u{1F30D}`, 'Second detail', 'Third detail', 'Fourth\tdetail'
+    ]);
+    assert.equal(document.contentBytes, bytes.length);
+    assert.equal(document.contentSha256, createHash('sha256').update(bytes).digest('hex'));
+
+    const detail = await context.request(`/api/documents/${job.id}`, undefined, 'GET');
+    assert.equal(detail.status, 200, await detail.clone().text());
+    const body = await detail.json();
+    assert.equal(body.format, 'docx');
+    assert.match(body.text, /Verified local Word file/);
+    assert.doesNotMatch(body.text, /Synthetic multilingual title|Second detail/);
+    assert.equal(state.tasks.find(item => item.id === task.id).title, title);
+    assert.equal(state.tasks.find(item => item.id === task.id).details, details);
+  }
+});
+
+test('invalid XML text fails in the real Word worker without recording an artifact before and after restart', async t => {
+  const context = await setup(t);
+  assert.equal((await context.request('/api/output-approval', { confirmPrivateNonSynced: true })).status, 200);
+  const tasks = [];
+  for (const [field, invalid] of [
+    ...['title', 'details'].flatMap(field => ['\uFFFE', '\uFFFF', '\uD800', '\uDFFF'].map(value => [field, value]))
+  ]) {
+    const response = await context.request('/api/tasks', {
+      title: field === 'title' ? `Synthetic invalid ${invalid}` : 'Synthetic invalid details',
+      details: field === 'details' ? `Synthetic ${invalid} detail` : ''
+    });
+    assert.equal(response.status, 201);
+    tasks.push((await response.json()).task);
+  }
+
+  for (const persisted of [false, true]) {
+    if (persisted) {
+      await context.updateSavedState(state => {
+        for (const [index, invalid] of ['\u0000', '\u000B'].entries()) {
+          state.tasks.push({
+            ...tasks[0], id: randomUUID(), title: `Synthetic legacy invalid ${index}`,
+            details: `Persisted invalid ${invalid} text`
+          });
+        }
+      });
+      tasks.push(...(await context.state()).tasks.filter(task => task.title.startsWith('Synthetic legacy invalid')));
+    }
+
+    for (const task of tasks) {
+      const queued = await context.request('/api/jobs', {
+        kind: 'word_document', taskId: task.id, requestId: randomUUID()
+      });
+      assert.equal(queued.status, 202);
+      const { job } = await queued.json();
+      await context.app.worker.tick();
+      const state = await context.state();
+      const failed = state.jobs.find(item => item.id === job.id);
+      assert.equal(failed.status, 'failed');
+      assert.match(failed.error, /XML 1\.0-invalid characters or unpaired surrogates/);
+      assert.equal(failed.result, null);
+      assert.equal(state.documents.some(document => document.id === job.id), false);
+      assert.equal(state.tasks.find(item => item.id === task.id).title, task.title);
+      assert.equal(state.tasks.find(item => item.id === task.id).details, task.details);
+      await assert.rejects(readFile(join(context.root, 'documents', `${job.id}.docx`)), { code: 'ENOENT' });
+    }
+  }
+});
+
+test('Word detail reads fail closed on replacement and growth during bounded descriptor reads', async t => {
+  const context = await setup(t);
+  assert.equal((await context.request('/api/output-approval', { confirmPrivateNonSynced: true })).status, 200);
+  const queued = await context.request('/api/jobs', { kind: 'word_document', requestId: randomUUID() });
+  assert.equal(queued.status, 202);
+  const { job } = await queued.json();
+  await context.app.worker.tick();
+  const document = (await context.state()).documents.find(item => item.id === job.id);
+  const file = join(context.root, 'documents', `${job.id}.docx`);
+  const original = await readFile(file);
+  const originalOpen = fs.promises.open;
+
+  for (const change of ['replace-identical', 'grow']) {
+    await writeFile(file, original);
+    let intercepted = false;
+    let requestedBytes = 0;
+    const hook = t.mock.method(fs.promises, 'open', async (...args) => {
+      const descriptor = await originalOpen(...args);
+      if (args[0] !== file) return descriptor;
+      const originalRead = descriptor.read.bind(descriptor);
+      descriptor.read = async (...readArgs) => {
+        requestedBytes += readArgs[2];
+        const result = await originalRead(...readArgs);
+        if (!intercepted) {
+          intercepted = true;
+          if (change === 'replace-identical') {
+            const displaced = join(context.root, 'displaced-synthetic.docx');
+            await rename(file, displaced);
+            await copyFile(displaced, file);
+          } else {
+            await fs.promises.appendFile(file, Buffer.alloc(1024 * 1024));
+          }
+        }
+        return result;
+      };
+      return descriptor;
+    });
+    syncBuiltinESMExports();
+    try {
+      const response = await context.request(`/api/documents/${job.id}`, undefined, 'GET');
+      assert.equal(response.status, 409);
+      const body = await response.json();
+      assert.match(body.error, /could not be verified as a bounded, single-link file on the workspace volume/);
+      assert.doesNotMatch(JSON.stringify(body), /documents[\\/][0-9a-f-]+\.docx/i);
+      assert.equal(intercepted, true);
+      assert.ok(requestedBytes <= original.length + 2, `read ${requestedBytes} bytes from a ${original.length}-byte file`);
+      assert.deepEqual((await context.state()).documents.find(item => item.id === job.id), document);
+    } finally {
+      hook.mock.restore();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
+test('Word details fail closed on invalid receipts, tampering, oversized files and linked paths', async t => {
+  const context = await setup(t);
+  await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
+  const queued = await context.request('/api/jobs', { kind: 'word_document', requestId: randomUUID() });
+  const { job } = await queued.json();
+  await context.app.worker.tick();
+  const document = (await context.state()).documents.find(item => item.id === job.id);
+  const file = join(context.root, 'documents', `${job.id}.docx`);
+  const original = await readFile(file);
+
+  for (const invalid of ['missing-hash', 'missing-size', 'malformed-hash', 'malformed-size']) {
+    await context.updateSavedState(state => {
+      const saved = state.documents.find(item => item.id === job.id);
+      if (invalid === 'missing-hash') delete saved.contentSha256;
+      else if (invalid === 'missing-size') delete saved.contentBytes;
+      else if (invalid === 'malformed-hash') saved.contentSha256 = 'not-a-digest';
+      else saved.contentBytes = 'not-a-size';
+    });
+    const response = await context.request(`/api/documents/${job.id}`, undefined, 'GET');
+    assert.equal(response.status, 409, invalid);
+    await context.updateSavedState(state => {
+      const saved = state.documents.find(item => item.id === job.id);
+      saved.contentBytes = document.contentBytes;
+      saved.contentSha256 = document.contentSha256;
+    });
+  }
+
+  await writeFile(file, Buffer.from('tampered replacement'));
+  assert.equal((await context.request(`/api/documents/${job.id}`, undefined, 'GET')).status, 409);
+  await writeFile(file, original);
+  await writeFile(file, Buffer.alloc(1024 * 1024 + 1));
+  assert.equal((await context.request(`/api/documents/${job.id}`, undefined, 'GET')).status, 409);
+  await writeFile(file, original);
+
+  const hardlink = join(context.root, 'linked-word.docx');
+  await link(file, hardlink);
+  assert.equal((await context.request(`/api/documents/${job.id}`, undefined, 'GET')).status, 409);
+  await unlink(hardlink);
+
+  await t.test('redirected file', async t => {
+    const outside = join(context.root, 'redirected-word.docx');
+    await writeFile(outside, original);
+    await unlink(file);
+    try {
+      await symlink(outside, file, 'file');
+    } catch (error) {
+      await writeFile(file, original);
+      if (!['EPERM', 'EACCES', 'ENOTSUP'].includes(error.code)) throw error;
+      return t.skip(`The environment does not permit file symlink tests (${error.code}).`);
+    }
+    assert.equal((await context.request(`/api/documents/${job.id}`, undefined, 'GET')).status, 409);
+    await unlink(file);
+    await writeFile(file, original);
+  });
+});
+
+test('worker does not reuse tampered existing Word or PowerPoint files', async t => {
+  for (const format of ['docx', 'pptx']) {
+    await t.test(format, async t => {
+      const context = await setup(t);
+      await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
+      let request;
+      let extension;
+      if (format === 'docx') {
+        request = { kind: 'word_document', requestId: randomUUID() };
+        extension = 'docx';
+      } else {
+        await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: true });
+        request = { kind: 'fake_demo', requestId: randomUUID(), confirmFakeOnly: true, format: 'pptx' };
+        extension = 'pptx';
+      }
+      const queued = await context.request('/api/jobs', request);
+      assert.equal(queued.status, 202);
+      const { job } = await queued.json();
+      await context.app.worker.tick();
+      const before = await context.state();
+      const document = before.documents.find(item => item.id === job.id);
+      const file = join(context.root, 'documents', `${job.id}.${extension}`);
+      const tampered = Buffer.from('different replacement bytes');
+      await writeFile(file, tampered);
+      await context.updateSavedState(state => {
+        const savedJob = state.jobs.find(item => item.id === job.id);
+        savedJob.status = 'queued';
+        savedJob.result = null;
+        savedJob.error = '';
+      });
+      await context.app.worker.tick();
+      const after = await context.state();
+      assert.equal(after.jobs.find(item => item.id === job.id).status, 'failed');
+      assert.match(after.jobs.find(item => item.id === job.id).error, /blocked or failed/i);
+      assert.deepEqual(after.documents.find(item => item.id === job.id), document);
+      assert.deepEqual(await readFile(file), tampered, 'the conflicting existing file is retained, not overwritten');
+    });
+  }
+});
+
 test('document creation never overwrites an existing different file', async t => {
   const context = await setup(t);
   await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
@@ -564,28 +968,281 @@ for (const targeted of [false, true]) {
   });
 }
 
-test('fake demo needs separate configuration and per-run confirmation, including after revocation', async t => {
+test('fake demo needs output and separate configuration approvals plus fresh confirmation, including after revocation', async t => {
   const context = await setup(t);
-  const job = { kind: 'fake_demo', requestId: randomUUID(), confirmFakeOnly: true };
+  const job = { kind: 'fake_demo', requestId: randomUUID(), confirmFakeOnly: true, format: 'markdown' };
   assert.equal((await context.request('/api/jobs', job)).status, 403);
   await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: true });
-  assert.equal((await context.request('/api/jobs', { kind: 'fake_demo', requestId: randomUUID() })).status, 403);
+  assert.equal((await context.request('/api/jobs', { kind: 'fake_demo', requestId: randomUUID(), confirmFakeOnly: true, format: 'markdown' })).status, 403);
+  assert.equal((await context.request('/api/jobs', { ...job, requestId: randomUUID(), format: undefined })).status, 400);
   assert.equal((await context.request('/api/jobs', { ...job, notes: 'Real customer input is not allowed.' })).status, 400);
   await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
   assert.equal((await context.request('/api/jobs', job)).status, 202);
   await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: false });
   await context.app.worker.tick();
-  assert.equal((await context.state()).jobs[0].status, 'failed');
+  const firstState = await context.state();
+  assert.equal(firstState.jobs[0].status, 'failed');
   assert.equal((await context.state()).documents.length, 0);
+  const failedJob = firstState.jobs[0];
   await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: true });
-  await context.request('/api/jobs', { ...job, requestId: randomUUID() });
+  const completed = await (await context.request('/api/jobs', { ...job, requestId: randomUUID() })).json();
   await context.app.worker.tick();
-  const state = await context.state();
-  assert.equal(state.jobs[0].status, 'completed');
-  const text = await readFile(join(context.root, 'documents', `${state.documents[0].id}.md`), 'utf8');
+  assert.equal((await context.state()).jobs.find(item => item.id === completed.job.id).status, 'completed');
+  const beforeRetry = structuredClone(failedJob);
+  const retryResponse = await context.request(`/api/jobs/${failedJob.id}/retry`, {});
+  assert.equal(retryResponse.status, 409);
+  assert.match((await retryResponse.json()).error, /cannot be retried.*fresh explicit request/i);
+  assert.deepEqual((await context.state()).jobs.find(item => item.id === failedJob.id), beforeRetry);
+  const replay = await context.request('/api/jobs', { ...job, requestId: failedJob.requestId });
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).job.id, failedJob.id);
+  assert.equal((await context.state()).jobs.length, 2, 'reused receipt IDs do not create or rerun another job');
+  assert.equal((await context.request('/api/jobs', { ...job, requestId: failedJob.requestId, format: 'pptx' })).status, 409);
+  const task = await (await context.request('/api/tasks', { title: 'Fake demo bypass test' })).json();
+  assert.equal((await context.request('/api/jobs', { ...job, requestId: randomUUID(), taskId: task.task.id })).status, 403);
+  assert.equal((await context.request('/api/jobs', { ...job, requestId: randomUUID(), customerName: 'Synthetic forbidden input' })).status, 400);
+  await context.request('/api/output-approval', { confirmPrivateNonSynced: false });
+  assert.equal((await context.request('/api/jobs', { ...job, requestId: randomUUID() })).status, 403);
+  assert.equal((await context.state()).jobs.length, 2, 'revoked output approval prevents new demo requests');
+  await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
+  const next = await context.request('/api/jobs', { ...job, requestId: randomUUID() });
+  assert.equal(next.status, 202);
+  const nextReceipt = await next.json();
+  assert.notEqual(nextReceipt.job.id, failedJob.id);
+  await context.restart();
+  const repeatedAfterRestart = await context.request('/api/jobs', { ...job, requestId: failedJob.requestId });
+  assert.equal(repeatedAfterRestart.status, 200);
+  assert.equal((await repeatedAfterRestart.json()).job.id, failedJob.id);
+  assert.equal((await context.state()).jobs.length, 3);
+  await context.app.worker.tick();
+  const finalState = await context.state();
+  assert.equal(finalState.jobs.find(item => item.id === nextReceipt.job.id).status, 'completed');
+  const firstCompleted = finalState.documents.find(item => item.id === completed.job.id);
+  const text = await readFile(join(context.root, 'documents', `${firstCompleted.id}.md`), 'utf8');
   assert.match(text, /FAKE DATA ONLY/);
   assert.match(text, /example\.invalid/);
   assert.doesNotMatch(text, /Real customer input/);
+});
+
+test('explicit PowerPoint demo is format-bound, local-only, typed, hashed and preserved by backup and recovery', async t => {
+  const context = await setup(t);
+  const requestId = randomUUID();
+  const request = { kind: 'fake_demo', requestId, confirmFakeOnly: true, format: 'pptx' };
+  assert.equal((await context.request('/api/jobs', request)).status, 403, 'output and demo approvals are both required');
+  await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: true });
+  assert.equal((await context.request('/api/jobs', request)).status, 403, 'local output approval is separately required');
+  await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
+  assert.equal((await context.request('/api/jobs', { ...request, format: '' })).status, 400, 'format is a deliberate choice');
+  assert.equal((await context.request('/api/jobs', { ...request, format: 'ppt' })).status, 400);
+  assert.equal((await context.request('/api/jobs', { ...request, taskId: randomUUID() })).status, 404);
+  const accepted = await context.request('/api/jobs', request);
+  assert.equal(accepted.status, 202);
+  const receipt = await accepted.json();
+  assert.equal(receipt.job.payload.format, 'pptx');
+  const duplicate = await context.request('/api/jobs', request);
+  assert.equal(duplicate.status, 202);
+  assert.equal((await duplicate.json()).deduplicated, true);
+  assert.equal((await context.request('/api/jobs', { ...request, format: 'markdown' })).status, 409);
+
+  await context.app.worker.tick();
+  let state = await context.state();
+  const job = state.jobs.find(item => item.id === receipt.job.id);
+  const document = state.documents.find(item => item.id === receipt.job.id);
+  const file = join(context.root, 'documents', `${job.id}.pptx`);
+  const original = await readFile(file);
+  assert.equal(job.status, 'completed');
+  assert.equal(job.result.format, 'pptx');
+  assert.match(job.result.text, /synthetic speaker notes.*not visually rendered/i);
+  assert.equal(document.format, 'pptx');
+  assert.equal(document.contentBytes, original.length);
+  assert.equal(document.contentSha256, createHash('sha256').update(original).digest('hex'));
+  assert.equal(state.documents.length, 1, 'same-ID format dedup creates one typed artifact record');
+  assert.equal((await context.request(`/api/jobs/${job.id}/retry`, {})).status, 409);
+  const preview = await (await context.request(`/api/documents/${document.id}`, undefined, 'GET')).json();
+  assert.equal(preview.format, 'pptx');
+  assert.equal(preview.contentBytes, original.length);
+  assert.match(preview.text, /not rendered in this app/);
+  assert.doesNotMatch(preview.text, /north@example\.invalid|Fictional facilitator/);
+  await assert.rejects(readFile(join(context.root, 'documents', `${job.id}.md`)), { code: 'ENOENT' });
+
+  await context.request('/api/jobs', { kind: 'backup', requestId: randomUUID() });
+  await context.app.worker.tick();
+  state = await context.state();
+  const backup = state.backups[0];
+  assert.equal(backup.coverage.documents.includedCount, 1);
+  const backupFile = join(context.root, 'backups', backup.id, 'documents', `${document.id}.pptx`);
+  assert.deepEqual(await readFile(backupFile), original);
+  const manifest = JSON.parse(await readFile(join(context.root, 'backups', backup.id, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.documents.files[0].format, 'pptx');
+
+  const recoveredResponse = await context.request(`/api/backups/${backup.id}/recover`, { confirmSeparateWorkspace: true });
+  assert.equal(recoveredResponse.status, 201);
+  const recoveredInfo = (await recoveredResponse.json()).recovery;
+  const recovered = await startServer({ dataDir: recoveredInfo.directory, port: 0, workerIntervalMs: 0, verifyLocalVolume: async () => true });
+  try {
+    const restored = await (await fetch(`${recovered.url}/api/state`, { headers: { 'X-Esquie-Access': recovered.accessToken } })).json();
+    assert.equal(restored.documents[0].format, 'pptx');
+    assert.equal(restored.documents[0].contentBytes, original.length);
+    assert.equal(restored.documents[0].contentSha256, document.contentSha256);
+    assert.deepEqual(await readFile(join(recoveredInfo.directory, 'documents', `${document.id}.pptx`)), original);
+    const restoredPreview = await (await fetch(`${recovered.url}/api/documents/${document.id}`, { headers: { 'X-Esquie-Access': recovered.accessToken } })).json();
+    assert.equal(restoredPreview.format, 'pptx');
+  } finally { await recovered.close(); }
+  await context.restart();
+  assert.equal((await context.state()).documents[0].format, 'pptx');
+  assert.deepEqual(await readFile(file), original);
+});
+
+test('PowerPoint details require a bounded exact file and valid generation receipt', async t => {
+  const context = await setup(t);
+  await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
+  await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: true });
+  const queued = await context.request('/api/jobs', {
+    kind: 'fake_demo', requestId: randomUUID(), confirmFakeOnly: true, format: 'pptx'
+  });
+  const job = (await queued.json()).job;
+  await context.app.worker.tick();
+  const originalDocument = (await context.state()).documents.find(item => item.id === job.id);
+  const file = join(context.root, 'documents', `${job.id}.pptx`);
+  const original = await readFile(file);
+  const details = () => context.request(`/api/documents/${job.id}`, undefined, 'GET');
+  assert.equal((await details()).status, 200);
+
+  for (const [label, change] of [
+    ['missing byte length', document => { delete document.contentBytes; }],
+    ['malformed content hash', document => { document.contentSha256 = 'not-a-digest'; }]
+  ]) {
+    await context.updateSavedState(state => change(state.documents.find(item => item.id === job.id)));
+    assert.equal((await details()).status, 409, label);
+    await context.updateSavedState(state => {
+      state.documents = state.documents.map(item => item.id === job.id ? { ...originalDocument } : item);
+    });
+  }
+
+  await writeFile(file, Buffer.from('tampered synthetic bytes'), { mode: 0o600 });
+  assert.equal((await details()).status, 409, 'same-path tampering is not returned as verified');
+  await writeFile(file, Buffer.alloc(1024 * 1024 + 1, 0x41), { mode: 0o600 });
+  assert.equal((await details()).status, 409, 'oversized binary is rejected before an unbounded read');
+  await unlink(file);
+  await writeFile(file, Buffer.from('replacement synthetic bytes'), { mode: 0o600 });
+  assert.equal((await details()).status, 409, 'a replaced path must match the generation receipt');
+  await writeFile(file, original, { mode: 0o600 });
+  assert.equal((await details()).status, 200);
+
+  await t.test('redirected paths are rejected when symlinks are supported', async nested => {
+    const outside = join(context.root, 'outside.pptx');
+    await writeFile(outside, original, { mode: 0o600 });
+    await unlink(file);
+    try { await symlink(outside, file, 'file'); }
+    catch (error) {
+      await writeFile(file, original, { mode: 0o600 });
+      if (['EACCES', 'EPERM', 'ENOTSUP', 'EOPNOTSUPP'].includes(error.code)) {
+        nested.skip(`Symlink creation is unavailable: ${error.code}`);
+        return;
+      }
+      throw error;
+    }
+    assert.notEqual((await details()).status, 200);
+    await unlink(file);
+    await writeFile(file, original, { mode: 0o600 });
+    await unlink(outside);
+  });
+
+  await t.test('hardlinked paths are rejected when hard links are supported', async nested => {
+    const alias = join(context.root, 'linked.pptx');
+    try { await link(file, alias); }
+    catch (error) {
+      if (['EACCES', 'EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'EXDEV'].includes(error.code)) {
+        nested.skip(`Hard-link creation is unavailable: ${error.code}`);
+        return;
+      }
+      throw error;
+    }
+    try { assert.notEqual((await details()).status, 200); }
+    finally { await unlink(alias); }
+  });
+});
+
+test('a different pre-existing PowerPoint file is never overwritten or adopted as a generated demo', async t => {
+  const context = await setup(t);
+  await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
+  await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: true });
+  const response = await context.request('/api/jobs', {
+    kind: 'fake_demo', requestId: randomUUID(), confirmFakeOnly: true, format: 'pptx'
+  });
+  const job = (await response.json()).job;
+  await mkdir(join(context.root, 'documents'), { recursive: true });
+  const target = join(context.root, 'documents', `${job.id}.pptx`);
+  await writeFile(target, Buffer.from('Keep pre-existing synthetic bytes.'), { mode: 0o600 });
+  const before = await readFile(target);
+  await context.app.worker.tick();
+  assert.equal((await context.state()).jobs.find(item => item.id === job.id).status, 'failed');
+  assert.equal((await context.state()).documents.length, 0);
+  assert.deepEqual(await readFile(target), before);
+});
+
+test('a queued worker document ID is reserved against Monthly Outcomes XLSX export', async t => {
+  const context = await setup(t);
+  await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
+  await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: true });
+  const queued = await context.request('/api/jobs', {
+    kind: 'fake_demo', requestId: randomUUID(), confirmFakeOnly: true, format: 'pptx'
+  });
+  const job = (await queued.json()).job;
+  const snapshotHash = await monthlyOutcomesSnapshotHash([]);
+  const exportResponse = await context.request('/api/outcomes/export', {
+    requestId: job.id, snapshotHash, recordCount: 0
+  });
+  assert.equal(exportResponse.status, 409);
+  assert.match((await exportResponse.json()).error, /reserved by a local document job/i);
+  assert.equal((await context.state()).outcomeExportRequests.length, 0);
+  assert.equal((await context.state()).jobs[0].status, 'queued');
+  await context.app.worker.tick();
+  const state = await context.state();
+  assert.equal(state.jobs[0].status, 'completed');
+  assert.equal(state.documents.length, 1);
+  assert.equal(state.documents[0].id, job.id);
+  assert.equal(state.documents[0].format, 'pptx');
+  await assert.rejects(readFile(join(context.root, 'documents', `monthly-outcomes-${job.id}.xlsx`)), { code: 'ENOENT' });
+});
+
+test('a cross-format record appearing at commit leaves worker output explicitly untracked', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'esquie-document-id-race-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const state = newWorkspace();
+  state.preferences.localOutputApproved = true;
+  state.preferences.demoApproved = true;
+  const job = enqueue(state, {
+    kind: 'fake_demo', requestId: randomUUID(),
+    payload: { confirmFakeOnly: true, format: 'pptx' }
+  });
+  const output = join(root, 'documents', `${job.id}.pptx`);
+  let insertedCollision = false;
+  const store = {
+    state,
+    update(change) {
+      if (!insertedCollision && fs.existsSync(output)) {
+        state.documents.push({
+          id: job.id, kind: 'monthly-outcomes-xlsx', format: 'xlsx',
+          fileName: `monthly-outcomes-${job.id}.xlsx`
+        });
+        insertedCollision = true;
+      }
+      return change(state);
+    }
+  };
+  const worker = createWorker({
+    store, root, intervalMs: 0, verifyOutput: async () => {}, assertOutput: () => {}
+  });
+  try {
+    await worker.tick();
+    assert.equal(insertedCollision, true);
+    assert.equal(job.status, 'failed');
+    assert.match(job.error, /file remains untracked for inspection/i);
+    assert.equal(state.documents.length, 1);
+    assert.equal(state.documents[0].format, 'xlsx');
+    assert.equal(fs.existsSync(output), true, 'the conflicting worker file is retained, not deleted');
+  } finally { await worker.stop(); }
 });
 
 test('a later demo revocation supersedes an earlier grant with a delayed body', async t => {
@@ -600,7 +1257,7 @@ test('demo job request with a delayed body is rejected if approval was revoked',
   const context = await setup(t);
   assert.equal((await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: true })).status, 200);
   const finish = await delayedBodyRequest(t, context, '/api/jobs', {
-    kind: 'fake_demo', requestId: randomUUID(), confirmFakeOnly: true
+    kind: 'fake_demo', requestId: randomUUID(), confirmFakeOnly: true, format: 'markdown'
   });
   assert.equal((await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: false })).status, 200);
   assert.equal(await finish(), 403);
@@ -630,7 +1287,7 @@ for (const { kind, revoked } of [
     await context.request('/api/output-approval', { confirmPrivateNonSynced: true });
     if (kind === 'fake_demo') await context.request('/api/demo-approval', { confirmSyntheticLocalOnly: true });
     const response = await context.request('/api/jobs', {
-      kind, requestId: randomUUID(), ...(kind === 'fake_demo' ? { confirmFakeOnly: true } : {})
+      kind, requestId: randomUUID(), ...(kind === 'fake_demo' ? { confirmFakeOnly: true, format: 'markdown' } : {})
     });
     assert.equal(response.status, 202);
     const job = (await response.json()).job;

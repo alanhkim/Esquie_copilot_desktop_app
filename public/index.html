@@ -13,17 +13,38 @@
   <div class="shell">
     <aside class="sidebar">
       <a class="brand" href="#board" aria-label="Esquie home"><span class="brand-mark">é</span><span>esquie<small>YOUR LOCAL WORKSPACE</small></span></a>
-      <p class="nav-label">WORK</p>
-      <nav class="navigation" aria-label="Work tools">
-        <button data-view="ask"><span>✧</span>Ask Esquie</button>
-        <button data-view="board" class="selected"><span>▦</span>Task board <b id="open-count">0</b></button>
-        <button data-view="drafts"><span>✎</span>Draft Studio</button>
-        <button data-view="demo"><span>▷</span>Create Demo</button>
-        <button data-view="links"><span>⊶</span>Links</button>
-        <button data-view="activity"><span>◷</span>Activity</button>
-        <button data-view="operations"><span>⎈</span>Operations</button>
-        <button id="resume-setup" type="button"><span>◇</span>Workspace setup</button>
-      </nav>
+      <div id="sidebar-work">
+        <p class="nav-label">WORK</p>
+        <nav class="navigation" aria-label="Work tools">
+          <button data-view="ask"><span>✧</span>Ask Esquie</button>
+          <button data-view="board" class="selected"><span>▦</span>Task board <b id="open-count">0</b></button>
+          <button data-view="completed-work"><span>✓</span>Completed work</button>
+          <button data-view="drafts"><span>✎</span>Draft Studio</button>
+          <button data-view="demo"><span>▷</span>Create Demo</button>
+          <button data-view="links"><span>⊶</span>Links</button>
+          <button data-view="activity"><span>◷</span>Activity</button>
+          <button data-view="operations"><span>⎈</span>Operations</button>
+          <button id="resume-setup" type="button"><span>◇</span>Workspace setup</button>
+        </nav>
+      </div>
+      <div id="sidebar-portfolio" hidden>
+        <p class="nav-label">LOCAL PORTFOLIO</p>
+        <nav class="navigation" aria-label="Portfolio views">
+          <button data-view="ssps" type="button">SSPs · local directory</button>
+          <button data-view="portfolio" type="button">Accounts</button>
+          <button data-view="heatmap" type="button">Accounts Heatmap</button>
+        </nav>
+      </div>
+      <div id="sidebar-outcomes" hidden>
+        <p class="nav-label">MONTHLY OUTCOMES</p>
+        <nav class="navigation" aria-label="Monthly Outcomes local views">
+          <button type="button" data-outcome-view="impact" aria-pressed="false">Workshop impact · unavailable</button>
+          <button type="button" data-outcome-view="outcomes" aria-pressed="false">Customer wins &amp; outcomes · local</button>
+          <button type="button" data-outcome-view="engagements" aria-pressed="false">Strategic engagements · local</button>
+          <button type="button" data-outcome-view="ahead" aria-pressed="false">What's ahead · local</button>
+          <button type="button" data-outcome-view="suggestions" aria-pressed="false">Suggested wins · unavailable</button>
+        </nav>
+      </div>
       <div class="sidebar-note"><span>✳</span><p>A quieter place<br>for focused work.</p><small>Your own tasks and next steps,<br>kept on this device.</small></div>
       <div class="connection-card">
         <div><i id="connection-dot"></i><strong id="connection-label">Local workspace</strong></div>
@@ -35,15 +56,24 @@
     <main>
       <header class="topbar">
         <nav class="top-tabs" aria-label="Workspace areas">
-          <button data-view="board" class="selected">Work</button>
-          <button data-view="portfolio">Accounts</button>
-          <button data-view="pipeline">Pipeline</button>
-          <button data-view="outcomes">Monthly Outcomes</button>
+          <button data-view="board" data-area="work" class="selected">Work</button>
+          <button data-view="portfolio" data-area="portfolio">SSPs &amp; Accounts</button>
+          <button data-view="pipeline" data-area="pipeline">Pipeline</button>
+          <button data-view="outcomes" data-area="outcomes">Monthly Outcomes</button>
         </nav>
         <span class="breadcrumb" id="breadcrumb">Task board</span>
         <span class="top-status"><i></i>Local workspace</span>
       </header>
       <div id="notice" class="notice" role="status" hidden></div>
+      <div id="generic-queue-panel" class="surface form" hidden>
+        <p id="generic-queue-status" role="status"></p>
+        <p class="muted">Only request identity and a salted input fingerprint survive same-tab, same-origin reload in session storage; notes never do. Inspect Activity before recovery. If absent, re-enter matching original notes for a same-ID retry. Closing the tab, clearing storage or changing origin does not carry this protection.</p>
+        <div class="workflow-actions">
+          <button id="generic-queue-inspect" class="button" type="button">Inspect request in Activity</button>
+          <button id="generic-queue-retry" class="button" type="button" hidden>Retry original inputs with same request ID</button>
+          <button id="generic-queue-new" class="button" type="button" hidden>Allow a separate explicit request</button>
+        </div>
+      </div>
 
       <section id="view-setup" class="view" hidden>
         <div class="page-heading"><div><p class="eyebrow">YOUR CHOICES · LOCAL ONLY</p><h1>Make this workspace <em>your own.</em></h1><p>Optional and resumable. Enter only your own authorized context. Nothing here signs in, verifies identity, grants source consent or creates demo data.</p></div></div>
@@ -72,8 +102,27 @@
           <label>Local account<select id="task-account-filter" aria-label="Filter tasks by local account"><option value="">All accounts</option><option value="unassigned">Unassigned</option></select></label>
           <label class="check"><input id="show-done" type="checkbox"> Show completed</label>
         </div>
-        <div id="task-list" class="task-board" aria-live="polite"></div>
+        <div id="task-list" class="task-board" role="region" aria-label="Task board lanes" tabindex="0" aria-live="polite"></div>
         <footer class="footer">Local changes stay in this workspace. <span>Only bounded reads and explicitly authorized unsent Outlook drafts are supported; messages are never sent.</span></footer>
+      </section>
+
+      <section id="view-completed-work" class="view" aria-labelledby="completed-work-heading" hidden>
+        <div class="page-heading"><div><p class="eyebrow">RECORDED WORK · LOCAL ONLY</p><h1 id="completed-work-heading">Completed <em>work.</em></h1><p>A read-only view of tasks currently marked complete, with their recorded details and evidence.</p></div></div>
+        <div class="toolbar completed-work-filters">
+          <label class="search"><span>⌕</span><input id="completed-work-search" type="search" placeholder="Find a task, note or evidence…" aria-label="Search completed tasks, notes and evidence"></label>
+          <label>Local account<select id="completed-work-account-filter" aria-label="Filter completed tasks by local account"><option value="">All accounts</option><option value="unassigned">Unassigned</option></select></label>
+          <label>Completion period<select id="completed-work-period" aria-label="Filter completed work by completion period">
+            <option value="all">All recorded completions, including unknown dates</option>
+            <option value="last30">Last 30 owner-local dates, including today</option>
+            <option value="last90">Last 90 owner-local dates, including today</option>
+            <option value="quarter">Current calendar quarter</option>
+            <option value="year">Current calendar year</option>
+            <option value="unknown">Unknown completion date</option>
+          </select></label>
+        </div>
+        <p id="completed-work-status" class="muted" role="status" aria-live="polite"></p>
+        <div id="completed-work-list" class="surface completed-work-region" role="region" aria-label="Completed work details" tabindex="0"></div>
+        <p class="muted">Periods use the saved owner timezone and recorded <code>completedAt</code>, not updated/imported timestamps. Date-bound periods are unavailable if that timezone is missing or invalid. Missing work types and records remain unknown; reopening is available only on the task board and removes a task from this current-completion view.</p>
       </section>
 
       <section id="view-ask" class="view" hidden>
@@ -81,7 +130,7 @@
         <div class="surface form">
           <h2>Local workspace tools</h2>
           <p>These queued tools work only with your recorded tasks or notes. No prompt or source content is interpreted as an instruction.</p>
-          <div class="workflow-actions"><button class="button primary" data-job="task_summary">Outline open tasks</button><button class="button" data-job="document">Save local task summary</button></div>
+          <div class="workflow-actions"><button class="button primary" data-job="task_summary">Outline open tasks</button><button class="button" data-job="document">Save local task summary as Markdown</button><button class="button" data-job="word_document">Save local task summary as Word</button></div>
           <form id="meeting-form" class="form">
             <label>Owner-provided meeting notes<textarea name="notes" rows="5" required maxlength="8000" placeholder="Paste your own notes; they will remain local and unverified."></textarea></label>
             <button type="submit" class="button">Queue local notes result</button>
@@ -146,6 +195,15 @@
         <div class="page-heading"><div><p class="eyebrow">NOTHING HAPPENS BEHIND THE CURTAIN</p><h1>The work, <em>as it happens.</em></h1><p>A local record of task and draft changes.</p></div></div>
         <h2 class="section-label">Durable worker queue</h2>
         <p id="worker-state" class="muted"></p>
+        <form id="meeting-insight-detail-form" class="surface form profile-form">
+          <h2>Selected insight detail</h2>
+          <p id="meeting-insight-detail-selection">No current insight selected. Choose an eligible item from a meeting list below.</p>
+          <p>Selecting an item does not authorize or fetch its detail. This separate approval requests one read-only detail; only a 600-character local preview is retained. AI content and claimed owners are unverified.</p>
+          <label class="inline-check"><input name="detailConsent" type="checkbox" required> I separately approve one detail read for this exact selected pair.</label>
+          <button type="submit" class="button">Queue approved detail read</button>
+          <button id="meeting-insight-detail-reset" type="button" class="button" hidden>I've checked Activity; start a new request</button>
+          <p id="meeting-insight-detail-status" role="status">No detail requested.</p>
+        </form>
         <div id="job-list" class="job-list"></div>
         <h2 class="section-label">Local documents</h2><div id="document-list" class="surface draft-list"></div>
         <h2 class="section-label">Recent changes</h2><div id="activity-list" class="surface activity-list"></div>
@@ -171,7 +229,7 @@
         </form>
         <form id="meeting-insight-list-form" class="surface form profile-form">
           <h2>List insight IDs for one meeting</h2>
-          <p>First add the exact meeting ID to meetingInsightMeetings and connect. This separately requested list returns at most 20 metadata records, not insight details. Results are historical local evidence; selecting a detail from a list is not yet supported.</p>
+          <p>First add the exact meeting ID to meetingInsightMeetings and connect. This separately requested list returns at most 20 metadata records, not insight details. In Activity, an eligible current result can be selected for separate detail approval; historical or stale results cannot.</p>
           <label>Authorized meeting ID<input name="meetingId" required maxlength="2000" autocomplete="off"></label>
           <label class="inline-check"><input name="listConsent" type="checkbox" required> I consent to list the first page for this meeting now.</label>
           <button type="submit" class="button">Queue selected meeting list</button>
@@ -206,7 +264,7 @@
         </form>
         <section class="surface form profile-form">
           <h2>Private state backups</h2>
-          <p>Consistent SQLite snapshots and verified generated Markdown files require local output approval. Older, missing, or unverifiable document files are reported as unavailable; source checkpoints remain partial/unavailable. Daily attempts respect pause and quiet hours; failures are visible in Activity. No automatic pruning occurs.</p>
+          <p>Consistent SQLite snapshots and eligible verified generated Markdown, Word DOCX, XLSX or PowerPoint files require local output approval. Older, missing, or unverifiable document files are reported as unavailable; source checkpoints remain partial/unavailable. Daily attempts respect pause and quiet hours; failures are visible in Activity. No automatic pruning occurs.</p>
           <button class="button" type="button" data-job="backup">Queue private backup</button>
           <div id="backup-list"></div>
           <div id="recovery-list"></div>
@@ -219,7 +277,7 @@
           <button type="submit" class="button">Save output approval or revocation</button>
         </form>
         <form id="demo-approval-form" class="surface form profile-form">
-          <h2>Demo configuration approval</h2><p>Only fixed fake-data local documents are supported. No remote repositories, secrets, customer input, or cloud resources are allowed.</p>
+          <h2>Demo configuration approval</h2><p>Only the fixed fake-data local Markdown or PowerPoint sample is supported. No remote repositories, secrets, customer input, or cloud resources are allowed.</p>
           <label class="inline-check"><input name="confirmSyntheticLocalOnly" type="checkbox"> Enable fixed synthetic-only local demo configuration.</label>
           <button type="submit" class="button">Save demo approval or revocation</button>
         </form>
@@ -227,12 +285,45 @@
       </section>
 
       <section id="view-pipeline" class="view" hidden>
-        <div class="page-heading"><div><p class="eyebrow">READ-ONLY REPORTING</p><h1>Your pipeline, <em>when connected.</em></h1><p>Reporting is not configured. No business data has been queried.</p></div></div>
-        <div class="empty-panel"><span class="tag">READ ONLY</span><h2>Pipeline unavailable</h2><p>Authorized reporting connections and model bindings are not implemented. This area will not create or change CRM records.</p></div>
+        <div class="page-heading"><div><p class="eyebrow">OWNER-PASTED LOCAL SNAPSHOTS</p><h1>Your pipeline, <em>as you supplied it.</em></h1><p>Live reporting remains disconnected. These tables are not synced, verified, or CRM-connected.</p></div></div>
+        <div class="empty-panel"><span class="tag">LIVE REPORTING DISCONNECTED</span><h2>Local snapshots only</h2><p>Choose Opportunities or Milestones, paste your own bounded table with your own headers, review the inert preview, then explicitly save a local snapshot. No identity matching, field mapping, calculations, source calls, or CRM writes are performed. Cell values—including formula-like text and links—are displayed as plain text and never evaluated or fetched.</p></div>
+        <form id="pipeline-snapshot-form" class="surface form profile-form">
+          <h2>Preview an owner-provided table</h2>
+          <label>Snapshot type<select name="type"><option value="opportunities">Opportunities</option><option value="milestones">Milestones</option></select></label>
+          <label>Table text <span>Markdown pipe table or tab-separated table; 1–30 columns, up to 100 rows and 16,000 characters</span><textarea name="text" rows="8" maxlength="16000" required placeholder="Opportunity | Owner-provided stage&#10;Example opportunity | Example stage"></textarea></label>
+          <div class="workflow-actions"><button id="pipeline-snapshot-preview" type="submit" class="button">Preview table</button><button id="pipeline-snapshot-discard" type="button" class="button" disabled>Discard preview</button></div>
+          <div id="pipeline-snapshot-preview-result" aria-live="polite"></div>
+          <label id="pipeline-snapshot-review-row" class="inline-check" hidden><input name="reviewed" type="checkbox"> I reviewed this exact preview and confirm saving a separate local snapshot.</label>
+          <button id="pipeline-snapshot-confirm" type="button" class="button primary" disabled>Confirm local snapshot</button>
+          <div id="pipeline-snapshot-uncertain-resolution" class="workflow-actions" hidden>
+            <button id="pipeline-snapshot-refresh-saved" type="button" class="button">Refresh saved snapshots</button>
+            <label class="inline-check"><input id="pipeline-snapshot-resolve-saved-check" type="checkbox" disabled> I checked the refreshed list and found this exact type and table.</label>
+            <button id="pipeline-snapshot-resolve-saved" type="button" class="button" disabled>Resolve as already saved</button>
+            <label class="inline-check"><input id="pipeline-snapshot-abandon-check" type="checkbox" disabled> I checked the complete refreshed list for this type, did not find this exact table, and understand the earlier request may still land.</label>
+            <button id="pipeline-snapshot-abandon" type="button" class="button" disabled>Abandon this retry and allow a new preview</button>
+          </div>
+          <p>Every snapshot is owner-pasted and unverified. Existing snapshots are retained. The workspace holds at most 50 snapshots; once full, new saves are refused without pruning earlier snapshots.</p>
+        </form>
+        <section class="surface form profile-form" aria-labelledby="pipeline-saved-heading">
+          <h2 id="pipeline-saved-heading">Saved pipeline snapshots</h2>
+          <label>Table type<select id="pipeline-view-type"><option value="opportunities">Opportunities</option><option value="milestones">Milestones</option></select></label>
+          <label>Saved snapshot<select id="pipeline-view-snapshot"></select></label>
+          <div class="toolbar records-toolbar">
+            <label class="search"><span aria-hidden="true">⌕</span><input id="pipeline-search" type="search" aria-label="Search every supplied cell" placeholder="Search every supplied cell…"></label>
+            <label>Filter column<select id="pipeline-filter-column"><option value="-1">All columns</option></select></label>
+            <label>Contains<input id="pipeline-filter-value" type="search" aria-label="Filter selected column by contained text"></label>
+          </div>
+          <div class="toolbar records-toolbar">
+            <label>Sort by<select id="pipeline-sort-column"><option value="-1">Original row order</option></select></label>
+            <label>Direction<select id="pipeline-sort-direction"><option value="asc">Ascending</option><option value="desc">Descending</option></select></label>
+          </div>
+          <p id="pipeline-snapshot-meta" class="muted" role="status"></p>
+          <div id="pipeline-snapshot-table" class="pipeline-table-wrap" aria-live="polite"></div>
+        </section>
       </section>
 
       <section id="view-outcomes" class="view" hidden>
-        <div class="page-heading"><div><p class="eyebrow">A RECORD OF CUSTOMER IMPACT</p><h1>Monthly <em>Outcomes.</em></h1><p>Reporting is not configured. No business data has been queried.</p></div></div>
+        <div class="page-heading"><div><p class="eyebrow">OWNER-SUPPLIED RECORDS · LOCAL ONLY</p><h1>Monthly <em>Outcomes.</em></h1><p>Browse local workshop imports, owner-entered outcomes and strategic engagements. These records are unverified and are not business reporting.</p></div></div>
         <div class="empty-panel"><span class="tag">SOURCE REPORTING DISCONNECTED</span><h2>Record your own local outcomes</h2><p>Entries below are owner-provided and unverified. Reporting is not configured; no live source read or automatic suggestion is implied.</p></div>
         <form id="outcome-import-form" class="surface form profile-form">
           <h2>Import owner-reviewed workshops</h2>
@@ -247,6 +338,16 @@
           <label id="outcome-import-review-row" class="inline-check" hidden><input name="reviewed" type="checkbox"> I reviewed this preview and confirm importing only the new rows shown.</label>
           <button id="outcome-import-confirm" type="button" class="button primary" disabled>Confirm local import</button>
         </form>
+        <section class="surface form profile-form" aria-labelledby="outcome-export-heading">
+          <h2 id="outcome-export-heading">Export local outcomes</h2>
+          <p>Save an editable XLSX file only in the approved private local Documents folder. This bounded export includes owner-entered outcome and engagement records; it does not include reference reporting metrics, charts, pivots, or live source data. Source URLs remain inert text, and cell contents are stored as literal text. Its 1 MiB file limit matches the per-file backup and recovery bound.</p>
+          <div class="workflow-actions">
+            <button id="outcome-export" type="button" class="button">Save local XLSX</button>
+            <button id="outcome-export-retry" type="button" class="button" hidden>Retry the same request safely</button>
+            <button id="outcome-export-reset" type="button" class="button" hidden>I checked Documents and Activity; allow a new request</button>
+          </div>
+          <p id="outcome-export-status" class="muted" role="status" aria-live="polite"></p>
+        </section>
         <form id="outcome-form" class="surface form profile-form">
           <label>Outcome or engagement<select name="category"><option value="outcome">Outcome</option><option value="engagement">Strategic engagement</option></select></label>
           <label>Title<input name="title" maxlength="160" required></label>
@@ -255,6 +356,22 @@
           <button class="button primary" type="submit">Save local entry</button>
           <p data-save-status class="muted" role="status"></p>
         </form>
+        <div class="toolbar records-toolbar">
+          <label class="search"><span>⌕</span><input id="outcome-search" type="search" placeholder="Search local outcomes and workshops…" aria-label="Search local outcomes and workshops"></label>
+          <label>Local view<select id="outcome-view-filter" aria-label="Filter Monthly Outcomes local view">
+            <option value="all">All local entries</option>
+            <option value="workshops">Workshop imports</option>
+            <option value="outcomes">Owner-entered outcomes</option>
+            <option value="engagements">Strategic engagements</option>
+            <option value="ahead">What's ahead · owner-timezone dates</option>
+            <option value="suggestions">Suggested wins · unavailable</option>
+            <option value="impact">Workshop impact · unavailable</option>
+            <option value="reporting">Business reporting · unavailable</option>
+          </select></label>
+          <span id="outcome-count" class="muted" role="status" aria-live="polite"></span>
+        </div>
+        <div id="outcome-view-unavailable" class="empty-panel" role="status" hidden></div>
+        <p id="outcome-view-note" class="muted" hidden></p>
         <div id="outcome-list" class="draft-list records-list"></div>
       </section>
 
@@ -267,13 +384,53 @@
           <label>Stakeholders you explicitly name <span>names, roles, and relationship context; never directory-matched</span><textarea name="stakeholders" rows="4" maxlength="4000"></textarea></label>
           <div class="workflow-actions"><button class="button primary" type="submit">Save local account</button><button id="account-cancel-edit" class="button" type="button" hidden>Cancel edit</button></div>
         </form>
+        <form id="account-metric-form" class="surface form">
+          <h2>Record your own local metric</h2>
+          <p>OWNER-ENTERED, UNVERIFIED observations only, not live reporting, a forecast, account verification or a connection to any reporting system. No official metric definitions are supplied.</p>
+          <label>Exact local account<select name="accountId" required><option value="">Choose an exact local account</option></select></label>
+          <label>Your metric label<input name="label" maxlength="100" required></label>
+          <label>Exact decimal value <span>up to 24 whole and 12 fractional digits; no exponent notation</span><input name="value" type="text" inputmode="decimal" maxlength="38" required></label>
+          <label>Unit <span>optional, as entered by you</span><input name="unit" maxlength="40"></label>
+          <label>Observation date <span>optional; left unknown when omitted</span><input name="date" type="date"></label>
+          <label class="inline-check"><input name="confirmOwnerEntered" type="checkbox" required> I am recording my own unverified local observation, not verified reporting.</label>
+          <button type="submit" class="button">Record owner-entered metric</button>
+          <p id="account-metric-status" class="muted" role="status"></p>
+        </form>
+        <button id="account-metric-check" type="button" class="button" hidden>Check saved metric outcome (read only)</button>
+        <button id="account-metric-repeat" type="button" class="button" aria-describedby="account-metric-status" hidden>Record a separate identical observation</button>
         <div class="toolbar records-toolbar"><label class="search"><span>⌕</span><input id="account-search" type="search" placeholder="Search your accounts and notes…" aria-label="Search local accounts"></label><span id="account-count" class="muted"></span></div>
         <div id="account-list" class="draft-list records-list"></div>
       </section>
 
+      <section id="view-ssps" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">OWNER-ENTERED · UNVERIFIED</p><h1>Your local SSP directory.</h1><p>Labels and selected account IDs are your own local context, not verified people, identities, affiliations or official assignments. No directory lookup, name matching, source query or reporting sync is performed.</p></div></div>
+        <button id="new-ssp" type="button" class="button">New local SSP record</button>
+        <form id="ssp-form" class="surface form">
+          <label>Local SSP record ID<input name="recordId" readonly required></label>
+          <label>Your SSP label<input name="title" maxlength="100" required></label>
+          <label>Explicit local account IDs <span>optional; multiple selections, maximum 50; no automatic association</span><select name="accountIds" multiple size="6"></select></label>
+          <label class="inline-check"><input name="confirmOwnerEntered" type="checkbox" required> I explicitly save this owner-entered, unverified local context and these account selections.</label>
+          <button type="submit" class="button">Save local SSP context</button>
+          <p id="ssp-status" class="muted" role="status"></p>
+        </form>
+        <button id="ssp-check" type="button" class="button" hidden>Check saved SSP outcome (read only)</button>
+        <div id="ssp-list" class="draft-list records-list"></div>
+      </section>
+
+      <section id="view-heatmap" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">OWNER-ENTERED · UNVERIFIED</p><h1>Accounts Heatmap, <em>without inferred health.</em></h1><p>A neutral table of your latest locally recorded metrics only. Missing observations are unknown, not zero. No official health, targets, thresholds, verified currency or current source status is inferred.</p></div></div>
+        <div id="account-heatmap" class="surface metric-matrix-container" tabindex="0" role="region" aria-label="Scrollable owner-entered account metric matrix"></div>
+      </section>
+
       <section id="view-demo" class="view" hidden>
-        <div class="page-heading"><div><p class="eyebrow">EXPLICIT, LOCAL, SYNTHETIC</p><h1>Try a <em>fake-only demo.</em></h1><p>This creates a fixed local sample document, not a repository or cloud resource.</p></div></div>
-        <form id="fake-demo-form" class="surface form"><h2>Fake data only</h2><p>No account names, customer data, secrets, prompts, or source content can be supplied to this generator. All examples use fictional names and example.invalid addresses. First approve the local demo configuration and non-synced output destination in Operations.</p><label class="inline-check"><input name="confirmFakeOnly" type="checkbox" required> I explicitly request one fixed fake-only local demo.</label><button class="button primary" type="submit">Queue approved fake-only local demo</button></form>
+        <div class="page-heading"><div><p class="eyebrow">EXPLICIT, LOCAL, SYNTHETIC</p><h1>Try a <em>fake-only demo.</em></h1><p>This creates one fixed local Markdown or PowerPoint sample, not a repository or cloud resource. The PowerPoint includes fixed fictional speaker notes and is not rendered in this app.</p></div></div>
+        <form id="fake-demo-form" class="surface form"><h2>Fake data only</h2><p>No account names, customer data, secrets, prompts, tasks, or source content can be supplied to this generator. All examples use fictional names and example.invalid addresses. First approve the local demo configuration and the privately verified, non-synced output destination in Operations.</p><label>Choose one output format<select name="format" required><option value="" selected disabled>Choose a format</option><option value="markdown">Markdown (.md)</option><option value="pptx">PowerPoint (.pptx)</option></select></label><label class="inline-check"><input name="confirmFakeOnly" type="checkbox" required> I explicitly request one fixed fake-only local demo in the selected format. I will confirm again for every new request.</label><button class="button primary" type="submit">Queue approved fake-only local demo</button></form>
+        <div id="demo-recovery" class="surface form" hidden>
+          <p id="demo-recovery-status" role="status"></p>
+          <button id="demo-review-activity" class="button" type="button">Review Activity before another attempt</button>
+          <label class="inline-check"><input id="demo-reviewed" type="checkbox"> I reviewed Activity and the prior outcome. I intend a separate new attempt, not a retry or recovery of the previous request.</label>
+          <button id="demo-allow-new" class="button" type="button">Allow a separate request with fresh fake-only consent</button>
+        </div>
       </section>
     </main>
   </div>
@@ -295,14 +452,24 @@
   <dialog id="conversation-dialog">
     <div class="form">
       <div class="dialog-heading"><div><p class="eyebrow">TASK CONTEXT · LOCAL ONLY</p><h2 id="conversation-title">Task notes</h2></div><button id="close-conversation" class="icon-button" aria-label="Close task notes">×</button></div>
+      <form id="task-owner-form" class="form">
+        <h3>Next owner (local context)</h3>
+        <p id="task-owner-current" class="muted"></p>
+        <p class="muted">Owner-entered, unverified label only. It does not identify an account, assign work, contact anyone, or authorize any action. Leave empty and save to clear.</p>
+        <label>Next owner label<input name="nextOwner" maxlength="250" autocomplete="off"></label>
+        <button class="button" type="submit">Save next owner locally</button>
+        <p data-save-status class="muted" role="status"></p>
+      </form>
       <h3>Task timeline</h3><div id="task-timeline"></div>
       <div id="conversation-messages" class="conversation-messages"></div>
       <form id="conversation-form" class="form"><label>Local note<textarea name="text" required maxlength="4000" rows="3"></textarea></label><button class="button primary" type="submit">Save note, not a command</button><p data-save-status class="muted" role="status"></p></form>
       <form id="evidence-form" class="form">
         <h3>Owner-provided evidence</h3>
-        <label>Title or email subject<input name="title" required maxlength="160"></label>
-        <label>Original HTTP(S) link<input name="url" required type="url" maxlength="2000"></label>
-        <label>Context note<textarea name="note" maxlength="3000" rows="2"></textarea></label>
+        <p class="muted">Types, links and notes are owner-entered and unverified. Nothing is fetched or contacted when saved.</p>
+        <label>Evidence type<select name="type"><option value="email">Email</option><option value="meeting">Meeting</option><option value="teams">Teams</option><option value="document">Document</option><option value="note">Note</option></select></label>
+        <label>Title or email subject<input name="title" required maxlength="500"></label>
+        <label>Original HTTP(S) link <span>optional</span><input name="url" type="url" maxlength="2000"></label>
+        <label>Context note<textarea name="note" maxlength="8000" rows="2"></textarea></label>
         <button class="button" type="submit">Attach unverified local evidence</button>
         <p data-save-status class="muted" role="status"></p>
       </form>

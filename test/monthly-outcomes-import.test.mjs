@@ -77,6 +77,54 @@ test('preview is read-only and confirmation is explicit; imported outcomes persi
   assert.equal(records[0].workshopImport.status, 'Delivered');
 });
 
+test('TSV parsing preserves empty optional edge cells through restart', async t => {
+  const context = await setup(t);
+  const text = [
+    'Notes\tDate\tAccount\tWorkshop\tSource URL',
+    '\t2020-10-12\tExample Account\tEdge-cell workshop\t'
+  ].join('\n');
+  const parsed = previewMonthlyOutcomeImport([], text).rows[0].record;
+  assert.equal(parsed.note, 'Status: Not provided');
+  assert.equal(parsed.sourceUrl, '');
+
+  const previewResponse = await context.post('/api/outcomes/import/preview', { text });
+  assert.equal(previewResponse.status, 200);
+  const preview = await previewResponse.json();
+  const confirmed = await context.post('/api/outcomes/import/confirm', {
+    text, revision: preview.revision, textHash: preview.textHash, reviewed: true
+  });
+  assert.equal(confirmed.status, 200);
+  await context.restart();
+  const saved = (await context.state()).records[0];
+  assert.equal(saved.title, 'Example Account - Edge-cell workshop');
+  assert.equal(saved.note, 'Status: Not provided');
+  assert.equal(saved.sourceUrl, '');
+});
+
+test('owner-entered outcomes and engagements retain order and unknown dates across restart', async t => {
+  const context = await setup(t);
+  const outcome = await context.post('/api/records', {
+    category: 'outcome', title: 'Shared label', note: 'Owner-entered, no verified status.'
+  });
+  assert.equal(outcome.status, 201);
+  const engagement = await context.post('/api/records', {
+    category: 'engagement', title: 'Shared label', date: '2099-12-31', note: 'Owner-entered only.'
+  });
+  assert.equal(engagement.status, 201);
+  const before = (await context.state()).records;
+  assert.equal(before.length, 2);
+  assert.ok(before.some(record => record.category === 'outcome' && record.date === ''));
+  assert.ok(before.some(record => record.category === 'engagement' && record.date === '2099-12-31'));
+  await context.restart();
+  const records = (await context.state()).records;
+  assert.deepEqual(records, before);
+  const savedOutcome = records.find(record => record.category === 'outcome');
+  const savedEngagement = records.find(record => record.category === 'engagement');
+  assert.equal(savedOutcome.note, 'Owner-entered, no verified status.');
+  assert.equal(savedOutcome.workshopImport, undefined);
+  assert.equal(savedEngagement.workshopImport, undefined);
+});
+
 test('exact duplicates are skipped and changed rows with the same identity are conflicts, never overwrites', async t => {
   const context = await setup(t);
   const firstPreview = await (await context.post('/api/outcomes/import/preview', { text: table })).json();
@@ -223,7 +271,7 @@ test('empty and all-dash TSV rows are rejected rather than ignored as separators
   );
 });
 
-test('only the immediate structural Markdown divider is skipped', () => {
+test('only the immediate structural Markdown divider with matching columns is skipped', () => {
   const markdown = [
     '| Date | Account | Workshop | Status |',
     '| --- | --- | --- | --- |',
@@ -233,6 +281,14 @@ test('only the immediate structural Markdown divider is skipped', () => {
   assert.throws(
     () => parseMonthlyOutcomeTable([...markdown, '| --- | --- | --- | --- |'].join('\n')),
     /Dates must use YYYY-MM-DD/
+  );
+  assert.throws(
+    () => parseMonthlyOutcomeTable([
+      markdown[0],
+      '| --- | --- |',
+      markdown[2]
+    ].join('\n')),
+    /same number of columns/
   );
 });
 

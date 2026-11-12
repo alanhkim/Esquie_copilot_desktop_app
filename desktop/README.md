@@ -66,11 +66,20 @@ or reference installation. Update the allowlist and packaging regression test
 when the backend introduces a new runtime module or dashboard asset. The account
 search and workspace modules are literal packaged assets; the resource check
 copies the allowlisted files and verifies that both module URLs are served.
+The local pipeline snapshot module is allowlisted and checked the same way.
+It stores only explicitly reviewed owner-pasted tables as unverified, append-only
+local snapshots; live reporting, source bindings, identity matching, and CRM
+changes remain unavailable.
+The Word summary writer and shared document-format validator are also explicit
+runtime resources covered by the artifact-free allowlist test. They generate
+local DOCX files; this does not establish native Word application rendering or
+visual parity.
 
 Workspace data is stored in `%LOCALAPPDATA%\EsquieLocal\Workspace`, outside the
-installation. Program updates and normal uninstall do not delete it. Back it up
-before upgrading, particularly when changing backend versions; no data migration
-or downgrade is promised by this wrapper. The first launch initializes a new
+installation. NSIS is configured with `deleteAppDataOnUninstall: false`, but
+preservation by installer install, upgrade or uninstall has not been verified.
+Make a separate backup before any installation change; no data migration or
+downgrade is promised by this wrapper. The first launch initializes a new
 workspace. The wrapper does not import any other installation or its data.
 This desktop default differs from the standalone dashboard default. To use the
 same **verified recreation** workspace, quit its current host and set

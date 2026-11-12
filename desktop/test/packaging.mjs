@@ -16,11 +16,12 @@ const builder = require.resolve('electron-builder/out/cli/cli.js');
 const electron = dirname(require.resolve('electron/package.json'));
 const electronDist = join(electron, 'dist');
 const expected = [
-  'src/server.mjs', 'src/store.mjs', 'src/worker.mjs', 'src/backups.mjs', 'src/monthly-outcomes-import.mjs',
-  'src/local-output.mjs', 'src/private-storage.mjs', 'src/windows-ocr.mjs', 'src/assistant/bridge.mjs',
+  'src/server.mjs', 'src/store.mjs', 'src/worker.mjs', 'src/backups.mjs', 'src/document-format.mjs', 'src/word-document.mjs', 'src/monthly-outcomes-import.mjs', 'src/monthly-outcomes-xlsx.mjs', 'src/pipeline-snapshots.mjs',
+  'src/local-output.mjs', 'src/private-storage.mjs', 'src/windows-ocr.mjs', 'src/fake-demo-pptx.mjs', 'src/assistant/bridge.mjs',
   'src/connectors/microsoft365.mjs', 'src/connectors/safe-file-download.mjs',
   'public/index.html', 'public/styles.css', 'public/app.js',
-  'public/task-board.mjs', 'public/account-search.mjs', 'public/account-workspace.mjs', 'public/outcome-import-workflow.mjs'
+  'public/task-board.mjs', 'public/completed-work.mjs', 'public/account-search.mjs', 'public/account-workspace.mjs', 'public/outcome-import-workflow.mjs',
+  'public/outcome-export-workflow.mjs', 'public/pipeline-snapshots.mjs', 'public/portfolio-workspace.mjs'
 ];
 const sentinels = [
   'src/private-sentinel.txt', 'src/private-sentinel.mjs',
@@ -94,6 +95,9 @@ try {
     "  const module = await fetch(`${app.url}/task-board.mjs`);",
     "  if (!module.ok || !/^text\\/javascript(?:;|$)/.test(module.headers.get('content-type'))) throw new Error('Task board module missing or not JavaScript.');",
     "  if (!(await module.text()).includes('export function matchingTasks')) throw new Error('Task board module content missing.');",
+    "  const completed = await fetch(`${app.url}/completed-work.mjs`);",
+    "  if (!completed.ok || !/^text\\/javascript(?:;|$)/.test(completed.headers.get('content-type'))) throw new Error('Completed-work module missing or not JavaScript.');",
+    "  if (!(await completed.text()).includes('export function completedWorkTasks')) throw new Error('Completed-work module content missing.');",
     "}",
     'finally { await app.close(); }'
   ].join('\n');
