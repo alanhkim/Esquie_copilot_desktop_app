@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { startServer } from '../src/server.mjs';
-import { previewMonthlyOutcomeImport } from '../src/monthly-outcomes-import.mjs';
+import { parseMonthlyOutcomeTable, previewMonthlyOutcomeImport } from '../src/monthly-outcomes-import.mjs';
 
 const table = [
   '| Date | Account | Workshop | Status | Notes | Source URL |',
@@ -175,6 +175,65 @@ test('tuple-encoded identities do not collide on pipe characters in TSV values',
   const preview = await (await context.post('/api/outcomes/import/preview', { text })).json();
   assert.deepEqual(preview.rows.map(row => row.state), ['new', 'new']);
   assert.notEqual(preview.rows[0].record.importKey, preview.rows[1].record.importKey);
+});
+
+test('tab-indented Markdown headers, dividers, and data retain Markdown parsing', () => {
+  const text = [
+    '| Date | Account | Workshop | Status |',
+    '| --- | --- | --- | --- |',
+    '| 2020-10-12 | Example Account | Example workshop | Scheduled |'
+  ].map(line => `\t${line}\t`).join('\n');
+  const [row] = parseMonthlyOutcomeTable(text);
+  assert.equal(row.record.workshopImport.account, 'Example Account');
+  assert.equal(row.record.workshopImport.workshop, 'Example workshop');
+});
+
+test('TSV preserves leading and trailing empty cells and literal pipes', () => {
+  const header = '\tDate\tAccount\tWorkshop\tStatus\t';
+  const row = '\t2020-10-12\tA|B\tC|D\tScheduled\t';
+  const [parsed] = parseMonthlyOutcomeTable(`${header}\n${row}`);
+  assert.equal(parsed.record.workshopImport.account, 'A|B');
+  assert.equal(parsed.record.workshopImport.workshop, 'C|D');
+  assert.throws(
+    () => parseMonthlyOutcomeTable(`${header}\n${row.slice(1)}`),
+    /same number of columns/
+  );
+  assert.throws(
+    () => parseMonthlyOutcomeTable(`${header.slice(1)}\n${row}`),
+    /same number of columns/
+  );
+});
+
+test('ambiguous mixed-delimiter headers fail visibly', () => {
+  assert.throws(
+    () => parseMonthlyOutcomeTable('Date\tAccount | Customer\tWorkshop\n2020-10-12\tExample\tSession'),
+    /mixes tab and pipe separators/
+  );
+});
+
+test('empty and all-dash TSV rows are rejected rather than ignored as separators', () => {
+  const header = 'Date\tAccount\tWorkshop\tStatus';
+  assert.throws(
+    () => parseMonthlyOutcomeTable(`${header}\n\t\t\t`),
+    /cannot contain empty rows/
+  );
+  assert.throws(
+    () => parseMonthlyOutcomeTable(`${header}\n---\t---\t---\t---`),
+    /Dates must use YYYY-MM-DD/
+  );
+});
+
+test('only the immediate structural Markdown divider is skipped', () => {
+  const markdown = [
+    '| Date | Account | Workshop | Status |',
+    '| --- | --- | --- | --- |',
+    '| 2020-10-12 | Example Account | Example workshop | Scheduled |'
+  ];
+  assert.equal(parseMonthlyOutcomeTable(markdown.join('\n')).length, 1);
+  assert.throws(
+    () => parseMonthlyOutcomeTable([...markdown, '| --- | --- | --- | --- |'].join('\n')),
+    /Dates must use YYYY-MM-DD/
+  );
 });
 
 test('outcomes persisted with the prior delimiter key still deduplicate by their saved workshop fields', () => {

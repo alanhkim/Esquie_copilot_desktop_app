@@ -33,12 +33,26 @@ function linkValue(value) {
   return url.href;
 }
 
-function splitRow(line) {
-  if (line.includes('\t')) return line.split('\t').map(cell => cell.trim());
-  if (!line.includes('|')) throw invalid('Paste a Markdown table or tab-separated table with a header row.');
-  const cells = line.trim().split('|').map(cell => cell.trim());
-  if (line.trim().startsWith('|')) cells.shift();
-  if (line.trim().endsWith('|')) cells.pop();
+function tableFormat(headerLine) {
+  const header = headerLine.trim();
+  const hasTabs = header.includes('\t');
+  const hasPipes = header.includes('|');
+  if (hasTabs && hasPipes) {
+    throw invalid('The header mixes tab and pipe separators; use a clearly formatted Markdown or TSV table.');
+  }
+  if (hasTabs) return 'tsv';
+  if (hasPipes) return 'markdown';
+  throw invalid('Paste a Markdown table or tab-separated table with a header row.');
+}
+
+function splitRow(line, format) {
+  if (format === 'tsv') return line.split('\t').map(cell => cell.trim());
+  const trimmed = line.trim();
+  if (trimmed.includes('\t')) throw invalid('Markdown rows cannot mix tabs with pipe separators.');
+  if (!trimmed.includes('|')) throw invalid('Paste a Markdown table or tab-separated table with a header row.');
+  const cells = trimmed.split('|').map(cell => cell.trim());
+  if (trimmed.startsWith('|')) cells.shift();
+  if (trimmed.endsWith('|')) cells.pop();
   return cells;
 }
 
@@ -80,9 +94,11 @@ export function parseMonthlyOutcomeTable(text, { today = null } = {}) {
   if (typeof text !== 'string' || !text.trim() || text.length > MAX_TEXT_LENGTH || text.includes('\0')) {
     throw invalid('Paste a non-empty workshop table of at most 16,000 characters.');
   }
-  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const lines = text.split(/\r?\n/).filter(line => line.includes('\t') || line.trim());
   if (lines.length < 2) throw invalid('Include a header row and at least one workshop row.');
-  const headers = splitRow(lines[0]).map(value => normalize(value).replace(/[^a-z0-9]/g, ''));
+  const format = tableFormat(lines[0]);
+  const markdown = format === 'markdown';
+  const headers = splitRow(lines[0], format).map(value => normalize(value).replace(/[^a-z0-9]/g, ''));
   const dateIndex = fieldIndex(headers, ['date'], true);
   const accountIndex = fieldIndex(headers, ['account', 'customer'], true);
   const workshopIndex = fieldIndex(headers, ['workshop', 'session', 'title'], true);
@@ -91,9 +107,12 @@ export function parseMonthlyOutcomeTable(text, { today = null } = {}) {
   const sourceIndex = fieldIndex(headers, ['sourceurl', 'source', 'link']);
 
   const rows = [];
-  for (const line of lines.slice(1)) {
-    const cells = splitRow(line);
-    if (cells.every(cell => /^:?-{3,}:?$/.test(cell))) continue;
+  for (const [index, line] of lines.slice(1).entries()) {
+    if (!line.trim()) throw invalid('Workshop tables cannot contain empty rows.');
+    const cells = splitRow(line, format);
+    if (cells.every(cell => !cell)) throw invalid('Workshop tables cannot contain empty rows.');
+    if (markdown && index === 0 && cells.length === headers.length &&
+      cells.every(cell => /^:?-{3,}:?$/.test(cell))) continue;
     if (cells.length !== headers.length) throw invalid('Every pasted row must have the same number of columns as the header.');
     const at = index => index < 0 ? '' : cells[index];
     const date = dateValue(at(dateIndex));
