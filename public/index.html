@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f5f1eb">
+  <title>Esquie — Your local workspace</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#board" aria-label="Esquie home"><span class="brand-mark">é</span><span>esquie<small>YOUR LOCAL WORKSPACE</small></span></a>
+      <p class="nav-label">WORK</p>
+      <nav class="navigation" aria-label="Work tools">
+        <button data-view="ask"><span>✧</span>Ask Esquie</button>
+        <button data-view="board" class="selected"><span>▦</span>Task board <b id="open-count">0</b></button>
+        <button data-view="drafts"><span>✎</span>Draft Studio</button>
+        <button data-view="demo"><span>▷</span>Create Demo</button>
+        <button data-view="links"><span>⊶</span>Links</button>
+        <button data-view="activity"><span>◷</span>Activity</button>
+        <button data-view="operations"><span>⎈</span>Operations</button>
+        <button id="resume-setup" type="button"><span>◇</span>Workspace setup</button>
+      </nav>
+      <div class="sidebar-note"><span>✳</span><p>A quieter place<br>for focused work.</p><small>Your own tasks and next steps,<br>kept on this device.</small></div>
+      <div class="connection-card">
+        <div><i id="connection-dot"></i><strong id="connection-label">Local workspace</strong></div>
+        <p id="connection-note">Workspace data stays on this device.</p>
+        <span class="local-tag">⌂ LOCAL ONLY</span>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <nav class="top-tabs" aria-label="Workspace areas">
+          <button data-view="board" class="selected">Work</button>
+          <button data-view="portfolio">Accounts</button>
+          <button data-view="pipeline">Pipeline</button>
+          <button data-view="outcomes">Monthly Outcomes</button>
+        </nav>
+        <span class="breadcrumb" id="breadcrumb">Task board</span>
+        <span class="top-status"><i></i>Local workspace</span>
+      </header>
+      <div id="notice" class="notice" role="status" hidden></div>
+
+      <section id="view-setup" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">YOUR CHOICES · LOCAL ONLY</p><h1>Make this workspace <em>your own.</em></h1><p>Optional and resumable. Enter only your own authorized context. Nothing here signs in, verifies identity, grants source consent or creates demo data.</p></div></div>
+        <p id="setup-progress" class="muted"></p>
+        <nav id="setup-steps" class="toolbar" aria-label="Setup steps"></nav>
+        <form id="setup-form" class="surface form profile-form">
+          <h2 id="setup-title"></h2><p id="setup-help" class="muted"></p>
+          <div id="setup-fields" class="form"></div>
+          <div class="dialog-actions"><button id="setup-back" type="button" class="button">Back</button><button id="setup-skip" type="button" class="button">Skip for now</button><button id="setup-save" type="submit" class="button primary">Save and continue</button></div>
+        </form>
+      </section>
+
+      <section id="view-board" class="view">
+        <div class="page-heading">
+          <div><p class="eyebrow">YOUR WORK, GATHERED IN ONE PLACE</p><h1>A calmer way to move <em>important work forward.</em></h1><p>Keep commitments close and choose one useful next step.</p></div>
+          <button id="new-task" class="button primary">＋ New task</button>
+        </div>
+        <div class="overview">
+          <div><strong id="stat-open">0</strong><span>open tasks</span></div>
+          <div><strong id="stat-waiting">0</strong><span>waiting</span></div>
+          <div><strong id="stat-done">0</strong><span>completed</span></div>
+          <p>Tasks are saved on this device. No external sources are connected.</p>
+        </div>
+        <div class="toolbar">
+          <label class="search"><span>⌕</span><input id="task-search" type="search" placeholder="Find a task or note…" aria-label="Search tasks"></label>
+          <label class="check"><input id="show-done" type="checkbox"> Show completed</label>
+        </div>
+        <div id="task-list" class="task-board" aria-live="polite"></div>
+        <footer class="footer">Changes stay in your local workspace. <span>External actions are not enabled.</span></footer>
+      </section>
+
+      <section id="view-ask" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">A SPACE FOR QUESTIONS</p><h1>Bring a question. <em>Find a next step.</em></h1><p>Your AI assistant is disconnected. Local tools below do not use AI or external sources.</p></div></div>
+        <div class="surface form">
+          <h2>Local workspace tools</h2>
+          <p>These queued tools work only with your recorded tasks or notes. No prompt or source content is interpreted as an instruction.</p>
+          <div class="workflow-actions"><button class="button primary" data-job="task_summary">Outline open tasks</button><button class="button" data-job="document">Save local task summary</button></div>
+          <form id="meeting-form" class="form">
+            <label>Owner-provided meeting notes<textarea name="notes" rows="5" required maxlength="8000" placeholder="Paste your own notes; they will remain local and unverified."></textarea></label>
+            <button type="submit" class="button">Queue local notes result</button>
+          </form>
+        </div>
+        <form id="assistant-form" class="surface form profile-form">
+          <h2>Copilot assistant</h2><p id="assistant-status">Unavailable: no audited runtime is connected. No SDK or account is accessed.</p>
+          <label>Explicit request<textarea name="prompt" maxlength="8000" rows="3" required disabled></textarea></label>
+          <button type="submit" class="button" disabled>Queue authorized assistant request</button>
+        </form>
+      </section>
+
+      <section id="view-drafts" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">YOUR WORDS, YOUR DECISION</p><h1>Shape the reply. <em>Keep it yours.</em></h1><p>Keep a local draft, or explicitly create an unsent reply after verified Outlook authorization. This app never sends email.</p></div><span class="tag">UNSENT · MANUAL REVIEW</span></div>
+        <div class="draft-layout">
+          <form id="draft-form" class="surface form">
+            <h2>New local draft</h2>
+            <label>To <span>optional, saved locally only</span><input name="recipient" maxlength="320" autocomplete="off"></label>
+            <label>Subject<input name="subject" required maxlength="240"></label>
+            <label>Draft body<textarea name="body" required maxlength="12000" rows="10"></textarea></label>
+            <button id="draft-save" class="button primary" type="submit">Save unsent draft</button>
+          </form>
+          <div class="surface">
+            <div class="section-title"><h2>Saved drafts</h2><span id="draft-count" class="tag">0</span></div>
+            <div id="draft-list" class="draft-list"></div>
+          </div>
+          <form id="outlook-draft-form" class="surface form profile-form">
+            <h2>Authorized Outlook reply draft</h2><p>Requires a trusted host token provider, verified current owner, mail source consent, and separate reply-draft opt-in in Operations. Select an exact mail item from a bounded source result in Activity; review participants and facts in Outlook.</p>
+            <label>Exact immutable original message ID<input name="messageId" required maxlength="2000" autocomplete="off"></label>
+            <label>Reply type<select name="replyAll"><option value="false">Reply</option><option value="true">Reply all - explicitly include thread participants</option></select></label>
+            <label>Your approved reply text<textarea name="text" required maxlength="12000" rows="5"></textarea></label>
+            <button type="submit" class="button">Create one unsent Outlook reply draft</button>
+            <p id="outlook-draft-result" role="status">Disconnected by default. Local drafts above are never synced automatically.</p>
+          </form>
+        </div>
+          <div class="surface profile-form"><h2>Outlook draft operation ledger</h2><p>Verified receipts and unknown outcomes survive restart. Uncertain operations are never automatically retried, sent, or deleted.</p><div id="remote-draft-ledger" class="draft-list"></div></div>
+      </section>
+
+      <section id="view-links" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">KEEP USEFUL CONTEXT CLOSE</p><h1>Your <em>links.</em></h1><p>Save a local pointer without fetching or syncing its destination.</p></div></div>
+        <div class="draft-layout">
+          <form id="link-form" class="surface form">
+            <h2>Save a link locally</h2>
+            <label>Label<input name="title" required maxlength="160" autocomplete="off"></label>
+            <label>HTTP(S) URL<input name="url" required maxlength="2000" type="url" placeholder="https://example.invalid/page" autocomplete="off"></label>
+            <p class="muted">Links are stored locally only. Esquie will not open or fetch them automatically.</p>
+            <button class="button primary" type="submit">Save link</button>
+          </form>
+          <div class="surface"><div class="section-title"><h2>Saved links</h2><span id="link-count" class="tag">0</span></div><div id="link-list" class="draft-list"></div></div>
+        </div>
+      </section>
+
+      <section id="view-activity" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">NOTHING HAPPENS BEHIND THE CURTAIN</p><h1>The work, <em>as it happens.</em></h1><p>A local record of task and draft changes.</p></div></div>
+        <h2 class="section-label">Durable worker queue</h2>
+        <p id="worker-state" class="muted"></p>
+        <div id="job-list" class="job-list"></div>
+        <h2 class="section-label">Local documents</h2><div id="document-list" class="surface draft-list"></div>
+        <h2 class="section-label">Recent changes</h2><div id="activity-list" class="surface activity-list"></div>
+      </section>
+
+      <section id="view-operations" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">LOCAL SETTINGS</p><h1>Connections &amp; <em>boundaries.</em></h1><p>Unavailable sources are shown as disconnected; no sign-in or live data access is attempted.</p></div></div>
+        <div id="connections" class="connection-grid"></div>
+        <form id="microsoft365-form" class="surface form profile-form">
+          <h2>Explicit Microsoft 365 connection</h2><p id="microsoft365-status">No authenticated host provider is configured.</p>
+          <p>These IDs are not credentials and do not sign you in. The host must authenticate the same owner through an approved delegated provider. Do not enter tokens, secrets, or tenant configuration from another person.</p>
+          <label>Your authenticated tenant ID<input name="tenantId" required maxlength="200" autocomplete="off"></label>
+          <label>Your authenticated user object ID<input name="userId" required maxlength="200" autocomplete="off"></label>
+          <label>Explicit source selections as JSON<textarea name="sources" rows="6" required maxlength="12000" spellcheck="false">{"mail":false,"calendar":false,"chats":[],"channels":[],"transcripts":[],"files":[]}</textarea></label>
+          <p>Pin only your approved chat IDs, team/channel pairs, meeting/transcript pairs, and drive/item pairs. No discovery, uploads, Loop reader, or meeting AI-insights API is implied.</p>
+          <label class="inline-check"><input name="allowReplyDrafts" type="checkbox"> Separately allow unsent same-thread Outlook reply drafts. Never send or delete.</label>
+          <label class="inline-check"><input name="consent" type="checkbox" required> I explicitly authorize these sources for my authenticated identity.</label>
+          <button id="microsoft365-connect" type="submit" class="button" disabled>Verify owner and selected consent</button>
+          <button id="microsoft365-disconnect" type="button" class="button">Disconnect and revoke this session</button>
+        </form>
+        <form id="profile-form" class="surface form profile-form">
+          <h2>Local workspace profile</h2>
+          <p>Optional details you enter here remain on this device. No account or identity is inferred.</p>
+          <label>Display name<input name="displayName" maxlength="80" autocomplete="off"></label>
+          <label>Timezone <span>optional IANA name, e.g. America/Los_Angeles</span><input name="timezone" maxlength="80" autocomplete="off" placeholder="America/Los_Angeles"></label>
+          <label>Your email <span>optional local context, not a sign-in</span><input name="email" type="email" maxlength="320" autocomplete="off"></label>
+          <label>Your role<input name="role" maxlength="160" autocomplete="off"></label>
+          <label>Manager <span>optional owner-provided context</span><input name="manager" maxlength="160" autocomplete="off"></label>
+          <label>People <span>owner-provided context only</span><textarea name="people" maxlength="2000" rows="3"></textarea></label>
+          <label>Workspace name <span>a local label, not a filesystem move</span><input name="workspaceName" maxlength="160"></label>
+          <label>Writing preferences<textarea name="writingStyle" maxlength="2000" rows="3"></textarea></label>
+          <button class="button primary" type="submit">Save profile locally</button>
+        </form>
+        <form id="preferences-form" class="surface form profile-form">
+          <h2>Worker preferences</h2>
+          <label class="inline-check"><input name="paused" type="checkbox"> Pause local worker</label>
+          <label class="inline-check"><input name="automaticRefresh" type="checkbox"> Attempt bounded source checks every 30 minutes</label>
+          <label class="inline-check"><input name="dailyBackups" type="checkbox"> Attempt one private workspace backup daily while open</label>
+          <label>Quiet hours start <span>profile timezone; clear both to disable</span><input name="quietStart" type="time"></label>
+          <label>Quiet hours end<input name="quietEnd" type="time"></label>
+          <p>Scheduling is opt-in. Pause and quiet hours defer queued work. Disconnected checks fail visibly; they never claim successful sync.</p>
+          <button class="button primary" type="submit">Save worker preferences</button>
+          <button class="button" type="button" data-job="source_refresh">Queue bounded source checks</button>
+        </form>
+        <section class="surface form profile-form">
+          <h2>Private state backups</h2>
+          <p>Consistent SQLite snapshots require local output approval. Daily attempts respect pause and quiet hours; failures are visible in Activity. Document files are excluded (metadata only); source checkpoints remain partial/unavailable. No automatic pruning occurs.</p>
+          <button class="button" type="button" data-job="backup">Queue private backup</button>
+          <div id="backup-list"></div>
+          <div id="recovery-list"></div>
+        </section>
+        <form id="output-form" class="surface form profile-form">
+          <h2>Local file output approval</h2>
+          <p id="output-directory" class="muted"></p>
+          <p>Cloud-sync detection is not universal. Verify this is a private, non-synced fixed local folder before approving. Network, removable, redirected, and known cloud-sync paths are rejected; an unverifiable destination keeps output disabled.</p>
+          <label class="inline-check"><input name="confirmPrivateNonSynced" type="checkbox"> I confirm this destination is private and not synchronized to any cloud library.</label>
+          <button type="submit" class="button">Save output approval or revocation</button>
+        </form>
+        <form id="demo-approval-form" class="surface form profile-form">
+          <h2>Demo configuration approval</h2><p>Only fixed fake-data local documents are supported. No remote repositories, secrets, customer input, or cloud resources are allowed.</p>
+          <label class="inline-check"><input name="confirmSyntheticLocalOnly" type="checkbox"> Enable fixed synthetic-only local demo configuration.</label>
+          <button type="submit" class="button">Save demo approval or revocation</button>
+        </form>
+        <div class="surface safety-note"><h2>Safety defaults</h2><p>Outlook is disconnected by default; local drafts are never sent. Teams and reporting remain read-only. Planner and Microsoft To Do are unavailable. No remote task mirrors or external notifications are used. Existing historical content never becomes a new command.</p></div>
+      </section>
+
+      <section id="view-pipeline" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">READ-ONLY REPORTING</p><h1>Your pipeline, <em>when connected.</em></h1><p>Reporting is not configured. No business data has been queried.</p></div></div>
+        <div class="empty-panel"><span class="tag">READ ONLY</span><h2>Pipeline unavailable</h2><p>Authorized reporting connections and model bindings are not implemented. This area will not create or change CRM records.</p></div>
+      </section>
+
+      <section id="view-outcomes" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">A RECORD OF CUSTOMER IMPACT</p><h1>Monthly <em>Outcomes.</em></h1><p>Reporting is not configured. No business data has been queried.</p></div></div>
+        <div class="empty-panel"><span class="tag">SOURCE REPORTING DISCONNECTED</span><h2>Record your own local outcomes</h2><p>Entries below are owner-provided, not verified reporting or imported wins. No workshop import, report query, or automatic suggestion is implied.</p></div>
+        <form id="outcome-form" class="surface form profile-form">
+          <label>Outcome or engagement<select name="category"><option value="outcome">Outcome</option><option value="engagement">Strategic engagement</option></select></label>
+          <label>Title<input name="title" maxlength="160" required></label>
+          <label>Date <span>optional</span><input name="date" type="date"></label>
+          <label>Your notes<textarea name="note" maxlength="4000" rows="3"></textarea></label>
+          <button class="button primary" type="submit">Save local entry</button>
+        </form>
+        <div id="outcome-list" class="draft-list records-list"></div>
+      </section>
+
+      <section id="view-portfolio" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">OWNER-PROVIDED CONTEXT</p><h1>Accounts, <em>kept locally.</em></h1><p>Manual notes do not prove account ownership or source verification.</p></div></div>
+        <form id="account-form" class="surface form">
+          <label>Account label<input name="title" maxlength="160" required></label>
+          <label>Your local context<textarea name="note" rows="3" maxlength="4000"></textarea></label>
+          <button class="button primary" type="submit">Save local account note</button>
+        </form>
+        <div id="account-list" class="draft-list records-list"></div>
+      </section>
+
+      <section id="view-demo" class="view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">EXPLICIT, LOCAL, SYNTHETIC</p><h1>Try a <em>fake-only demo.</em></h1><p>This creates a fixed local sample document, not a repository or cloud resource.</p></div></div>
+        <form id="fake-demo-form" class="surface form"><h2>Fake data only</h2><p>No account names, customer data, secrets, prompts, or source content can be supplied to this generator. All examples use fictional names and example.invalid addresses. First approve the local demo configuration and non-synced output destination in Operations.</p><label class="inline-check"><input name="confirmFakeOnly" type="checkbox" required> I explicitly request one fixed fake-only local demo.</label><button class="button primary" type="submit">Queue approved fake-only local demo</button></form>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="task-dialog">
+    <form id="task-form" method="dialog" class="form">
+      <div class="dialog-heading"><div><p class="eyebrow">LOCAL TASK</p><h2 id="task-dialog-title">Make a little progress.</h2></div><button id="close-task" class="icon-button" type="button" aria-label="Close">×</button></div>
+      <label>Title<input name="title" required maxlength="160" autocomplete="off"></label>
+      <label>Details <span>optional</span><textarea name="details" maxlength="3000" rows="4"></textarea></label>
+      <label>Status<select name="status"><option value="next">Next up</option><option value="doing">In progress</option><option value="waiting">Waiting</option><option value="done">Completed</option></select></label>
+      <label>Priority<select name="priority"><option value="normal">Normal</option><option value="important">Important</option></select></label>
+      <label>Due date <span>optional</span><input name="dueDate" type="date"></label>
+      <div class="dialog-actions"><button id="cancel-task" type="button" class="button">Cancel</button><button class="button primary" type="submit">Save task</button></div>
+    </form>
+  </dialog>
+  <dialog id="conversation-dialog">
+    <div class="form">
+      <div class="dialog-heading"><div><p class="eyebrow">TASK CONTEXT · LOCAL ONLY</p><h2 id="conversation-title">Task notes</h2></div><button id="close-conversation" class="icon-button" aria-label="Close task notes">×</button></div>
+      <h3>Task timeline</h3><div id="task-timeline"></div>
+      <div id="conversation-messages" class="conversation-messages"></div>
+      <form id="conversation-form" class="form"><label>Local note<textarea name="text" required maxlength="4000" rows="3"></textarea></label><button class="button primary" type="submit">Save note, not a command</button></form>
+      <form id="evidence-form" class="form">
+        <h3>Owner-provided evidence</h3>
+        <label>Title or email subject<input name="title" required maxlength="160"></label>
+        <label>Original HTTP(S) link<input name="url" required type="url" maxlength="2000"></label>
+        <label>Context note<textarea name="note" maxlength="3000" rows="2"></textarea></label>
+        <button class="button" type="submit">Attach unverified local evidence</button>
+      </form>
+      <div id="task-evidence" class="draft-list"></div>
+      <button id="summarize-task" class="button">Queue local task outline</button>
+    </div>
+  </dialog>
+  <dialog id="document-dialog"><div class="form"><div class="dialog-heading"><h2>Local document</h2><button id="close-document" class="icon-button" aria-label="Close local document">×</button></div><pre id="document-text" class="document-text"></pre></div></dialog>
+</body>
+</html>

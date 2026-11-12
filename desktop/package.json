@@ -1,0 +1,57 @@
+{
+  "name": "esquie-local-desktop",
+  "productName": "Esquie Local",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows host for the local workspace",
+  "author": "Esquie Local contributors",
+  "type": "module",
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.mjs",
+    "test:package": "node test/packaging.mjs",
+    "smoke": "electron test/smoke.mjs",
+    "dist": "electron-builder --win nsis --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "44.9.1",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "local.esquie.workspace.desktop",
+    "publish": [],
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.mjs",
+      "app.mjs",
+      "host.mjs",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "../src", "to": "workspace/src", "filter": [
+        "server.mjs", "store.mjs", "worker.mjs", "backups.mjs",
+        "local-output.mjs", "private-storage.mjs",
+        "assistant/bridge.mjs", "connectors/microsoft365.mjs"
+      ] },
+      { "from": "../public", "to": "workspace/public", "filter": [
+        "index.html", "styles.css", "app.js"
+      ] }
+    ],
+    "win": {
+      "target": "nsis",
+      "signAndEditExecutable": false,
+      "artifactName": "Esquie-Local-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
