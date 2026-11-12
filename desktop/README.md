@@ -12,22 +12,41 @@ Device permissions and downloads are denied.
 
 Use Windows x64, Node 22.13 or newer, npm, and access to your approved npm
 registry and Electron download hosts. The lockfile uses the configured registry
-instead of embedding registry tarball locations. From the repository's `desktop`
-directory:
+instead of embedding registry tarball locations. From the verified recreation's
+checkout root, follow the guarded [desktop setup and launch](../README.md#requirements-and-startup)
+instructions; they require an explicit verified recreation workspace. Stop all
+other hosts first. For updates, follow the guarded
+[update instructions](../README.md#storage-output-and-upgrades) and then the
+desktop setup instructions. Never select the reference installation.
+
+To run desktop verification from the checkout root, copy and run this entire
+single line. This artifact-free test does not run Electron or build an installer:
 
 ```powershell
-npm ci
-npm test
-npm run test:package
-npm run smoke -- --synthetic
-npm run smoke
-npm start
-npm run dist
+& { $ErrorActionPreference = 'Stop'; $null = Get-Command git -ErrorAction Stop; $null = Get-Command npm.cmd -ErrorAction Stop; $root = @(git rev-parse --show-toplevel 2>$null); if ($LASTEXITCODE -ne 0 -or $root.Count -ne 1 -or [System.IO.Path]::GetFullPath($root[0]) -ne [System.IO.Path]::GetFullPath((Get-Location).Path)) { throw 'Enter the verified recreation checkout root first.' }; $origin = @(git remote get-url origin 2>$null); if ($LASTEXITCODE -ne 0 -or $origin.Count -ne 1 -or $origin[0] -notmatch '^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)alanhkim/Esquie_copilot_desktop_app(\.git)?/?$') { throw 'Checkout origin is not the expected public recreation; stop and verify.' }; npm.cmd --prefix desktop test; if ($LASTEXITCODE -ne 0) { throw 'Desktop tests failed.' } }
 ```
 
 Some npm installations restrict dependency install scripts or downloads. Follow
 local policy for the required Electron installation; do not bypass organizational
 restrictions. Run `npm audit` using an available advisory endpoint before release.
+
+## Optional native validation
+
+Only after independent source and policy review, on an approved isolated host
+with policy-compliant dependencies and artifacts, an owner may deliberately run
+the following separate line from the verified checkout root. `test:package`
+creates an unpacked build with `electron-builder --dir`, not an installer; both
+smoke checks launch Electron using temporary data. The sequence stops on failure.
+It is not part of ordinary verification:
+
+```powershell
+& { $ErrorActionPreference = 'Stop'; $null = Get-Command git -ErrorAction Stop; $null = Get-Command npm.cmd -ErrorAction Stop; $root = @(git rev-parse --show-toplevel 2>$null); if ($LASTEXITCODE -ne 0 -or $root.Count -ne 1 -or [System.IO.Path]::GetFullPath($root[0]) -ne [System.IO.Path]::GetFullPath((Get-Location).Path)) { throw 'Enter the verified recreation checkout root first.' }; $origin = @(git remote get-url origin 2>$null); if ($LASTEXITCODE -ne 0 -or $origin.Count -ne 1 -or $origin[0] -notmatch '^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)alanhkim/Esquie_copilot_desktop_app(\.git)?/?$') { throw 'Checkout origin is not the expected public recreation; stop and verify.' }; npm.cmd --prefix desktop run test:package; if ($LASTEXITCODE -ne 0) { throw 'Package boundary checks failed; stopping native validation.' }; npm.cmd --prefix desktop run smoke -- --synthetic; if ($LASTEXITCODE -ne 0) { throw 'Synthetic smoke failed; stopping native validation.' }; npm.cmd --prefix desktop run smoke; if ($LASTEXITCODE -ne 0) { throw 'Desktop smoke failed.' } }
+```
+
+Installer creation is separate from both sequences. Only after independent source
+and policy review may an owner deliberately run `npm.cmd --prefix desktop run dist`
+from the checkout root; it creates an unsigned installer and does not establish
+installer validation.
 
 ## Scoped desktop verification
 
@@ -82,13 +101,9 @@ Make a separate backup before any installation change; no data migration or
 downgrade is promised by this wrapper. The first launch initializes a new
 workspace. The wrapper does not import any other installation or its data.
 This desktop default differs from the standalone dashboard default. To use the
-same **verified recreation** workspace, quit its current host and set
-`ESQUIE_DATA_DIR` to that private local directory before starting either host:
-
-```powershell
-$env:ESQUIE_DATA_DIR = 'C:\path\to\verified-recreation-workspace'
-npm start
-```
+same **verified recreation** workspace, quit its current host and use the guarded
+[later-launch command](../README.md#requirements-and-startup), choosing `desktop`
+and that exact private local directory.
 
 Set the variable in the environment that launches the desktop app; a shortcut or
 sign-in startup may not inherit a terminal-only setting. With no override, the
