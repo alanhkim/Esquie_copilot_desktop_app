@@ -6,6 +6,13 @@ An independently authored, local-first chief-of-staff workspace: tasks and conve
 
 **Connections are disconnected by default.** Microsoft 365 adapters require a trustworthy, separately authorized host token provider; no sign-in provider is installed here. Copilot remains unavailable until an audited runtime and identity boundary exist. No tests access real accounts.
 
+> **Current operational warnings — the code limitations remain.**
+> - Legacy invalid timezone state can make worker ticks fail, and incomplete or malformed quiet-hour state may be treated as no quiet window. Keep the worker paused; if pausing is rejected, quit the host and do not resume scheduled work until the saved timezone and both quiet-hour values are corrected.
+> - Mixed successful and denied source reads can show misleading availability. Stored source previews are historical, not proof of current source selection or consent; a read already in flight can finish and retain results after pause, quiet hours, or shutdown. Keep optional/injected connectors disconnected and do not act on historical source previews.
+> - After an uncertain response, resubmitting with a new request ID can duplicate work. Demo Retry does not ask for fresh fake-only confirmation. Inspect Activity and any output before resubmitting; do not retry demos.
+>
+> Microsoft 365 and Copilot remain disconnected by default. The workshop-import parser correction is already present in this public main branch.
+
 ## Requirements and startup
 
 - Node.js **22.13 or newer** with `node:sqlite` (a current stable Node 24 release is recommended).
