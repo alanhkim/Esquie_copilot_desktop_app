@@ -75,9 +75,14 @@ responses remain unconfirmed. Exact NFC/control-stripped/trimmed link URL normal
 matches the server. Non-mutating task deduplication accepts legacy
 receipts without revisions and never binds them as edits or invents a revision.
 Known saves followed by refresh failure are reported separately from rejected
-saves; uncertain mutation outcomes block the form until reload and record review.
-This guard is window-local, not a durable local-operation ledger. It changes no
-Outlook authorization, source validation or cloud behavior.
+saves; uncertain mutation outcomes generally block the form until reload and
+record review. An unstructured or unreadable 4xx can be classified as a
+rejection before its body is validated, unlocking another submission even
+though the mutation outcome is unconfirmed. Inspect the saved task, note or
+other local record before retrying instead of relying on the apparent rejection;
+this warning does not apply to a validated structured rejection. This guard is
+window-local, not a durable local-operation ledger. It changes no Outlook
+authorization, source validation or cloud behavior.
 
 Only identical saved labels plus normalized saved-link URLs deduplicate on the
 local server, including concurrent submissions and retries after restart.
